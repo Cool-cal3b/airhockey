@@ -1,15 +1,16 @@
-FROM node:20-alpine AS build
+FROM node:20-slim AS build
 
 WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm ci
+COPY package.json ./
+RUN npm install
 COPY . .
 RUN npm run build
 
-FROM node:20-alpine AS production
+FROM node:20-slim AS production
 
 WORKDIR /app
 COPY --from=build /app/build ./build
+COPY --from=build /app/server.js ./
 COPY --from=build /app/package.json ./
 COPY --from=build /app/node_modules ./node_modules
 
@@ -17,4 +18,4 @@ ENV NODE_ENV=production
 ENV PORT=3000
 EXPOSE 3000
 
-CMD ["node", "build/index.js"]
+CMD ["node", "server.js"]

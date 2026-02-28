@@ -4,9 +4,9 @@
   "private": true,
   "scripts": {
     "dev": "vite dev",
-    "build": "vite build",
+    "build": "vite build && node build-socket.js",
     "preview": "vite preview",
-    "start": "node build/index.js",
+    "start": "node server.js",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
   },
   "devDependencies": {
@@ -19,6 +19,7 @@
     "vite": "^6.0.0"
   },
   "dependencies": {
+    "airhockey": "file:",
     "phaser": "^3.88.2",
     "socket.io": "^4.8.3",
     "socket.io-client": "^4.8.3"
