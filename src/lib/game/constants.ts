@@ -16,6 +16,9 @@ export const PADDLE_MAX_SPEED = 4000;
 export const TICK_RATE = 60;
 export const TICK_MS = 1000 / TICK_RATE;
 
+export const NETWORK_RATE = 30;
+export const NETWORK_MS = 1000 / NETWORK_RATE;
+
 export const COUNTDOWN_SECONDS = 3;
 export const GOAL_RESET_DELAY_MS = 1500;
 

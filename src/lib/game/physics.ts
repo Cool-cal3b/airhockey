@@ -3,6 +3,7 @@ import {
 	RINK_HEIGHT,
 	PADDLE_RADIUS,
 	PUCK_RADIUS,
+	CORNER_RADIUS,
 	GOAL_X_MIN,
 	GOAL_X_MAX
 } from './constants.js';
@@ -51,6 +52,49 @@ export function resolvePuckPaddleCollision(
 	return { x: separatedX, y: separatedY, vx: newVx, vy: newVy };
 }
 
+const CORNER_CENTERS = [
+	{ cx: CORNER_RADIUS, cy: CORNER_RADIUS },
+	{ cx: RINK_WIDTH - CORNER_RADIUS, cy: CORNER_RADIUS },
+	{ cx: CORNER_RADIUS, cy: RINK_HEIGHT - CORNER_RADIUS },
+	{ cx: RINK_WIDTH - CORNER_RADIUS, cy: RINK_HEIGHT - CORNER_RADIUS }
+];
+
+function resolveCornerCollision(
+	x: number, y: number, vx: number, vy: number
+): { x: number; y: number; vx: number; vy: number; hit: boolean } {
+	const r = CORNER_RADIUS - PUCK_RADIUS;
+	const bounce = 0.9;
+
+	for (const { cx, cy } of CORNER_CENTERS) {
+		const inCornerX = (cx < RINK_WIDTH / 2) ? x < cx : x > cx;
+		const inCornerY = (cy < RINK_HEIGHT / 2) ? y < cy : y > cy;
+		if (!inCornerX || !inCornerY) continue;
+
+		const dx = x - cx;
+		const dy = y - cy;
+		const distSq = dx * dx + dy * dy;
+
+		if (distSq <= r * r) continue;
+
+		const dist = Math.sqrt(distSq);
+		const nx = dx / dist;
+		const ny = dy / dist;
+
+		x = cx + nx * r;
+		y = cy + ny * r;
+
+		const dot = vx * nx + vy * ny;
+		if (dot > 0) {
+			vx -= (1 + bounce) * dot * nx;
+			vy -= (1 + bounce) * dot * ny;
+		}
+
+		return { x, y, vx, vy, hit: true };
+	}
+
+	return { x, y, vx, vy, hit: false };
+}
+
 export function containPuckInRink(
 	x: number,
 	y: number,
@@ -58,6 +102,15 @@ export function containPuckInRink(
 	vy: number
 ): { x: number; y: number; vx: number; vy: number; scored: 'host' | 'guest' | null } {
 	let scored: 'host' | 'guest' | null = null;
+
+	const corner = resolveCornerCollision(x, y, vx, vy);
+	if (corner.hit) {
+		return { ...corner, scored: null };
+	}
+	x = corner.x;
+	y = corner.y;
+	vx = corner.vx;
+	vy = corner.vy;
 
 	if (x - PUCK_RADIUS < 0) {
 		x = PUCK_RADIUS;

@@ -5,13 +5,15 @@ import {
 	CANVAS_PADDING,
 	PADDLE_RADIUS,
 	PUCK_RADIUS,
+	PUCK_FRICTION,
 	GOAL_WIDTH,
 	CENTER_CIRCLE_RADIUS,
 	CORNER_RADIUS,
 	GOAL_X_MIN,
 	GOAL_X_MAX,
 	PADDLE_MAX_SPEED,
-	TICK_MS
+	TICK_MS,
+	NETWORK_MS
 } from '../constants.js';
 import { clampPaddleToHalf } from '../physics.js';
 import { PointerInput } from '../input.js';
@@ -42,12 +44,18 @@ export class PlayScene extends Phaser.Scene {
 	private goalText!: Phaser.GameObjects.Text;
 
 	private latestState: GameState | null = null;
+	private prevState: GameState | null = null;
 	private stateTimestamp = 0;
+	private prevStateTimestamp = 0;
 
 	private localPaddle = { x: 0, y: 0 };
 	private lastFrameTime = 0;
+	private lastPaddleSendTime = 0;
 	private prevStatus: GameState['status'] | null = null;
 	private graceUntil = 0;
+
+	private interpPuck = { x: 0, y: 0 };
+	private interpOpponent = { x: 0, y: 0 };
 
 	private scoreCallback?: (host: number, guest: number) => void;
 	private statusCallback?: (status: GameState['status']) => void;
@@ -199,6 +207,8 @@ export class PlayScene extends Phaser.Scene {
 
 	private setupSocketListeners() {
 		this.socket.on('gameState', (state: GameState) => {
+			this.prevState = this.latestState;
+			this.prevStateTimestamp = this.stateTimestamp;
 			this.latestState = state;
 			this.stateTimestamp = performance.now();
 
@@ -254,6 +264,34 @@ export class PlayScene extends Phaser.Scene {
 		};
 	}
 
+	private interpolatePuck(state: GameState, dt: number, timeSinceState: number) {
+		const frictionFactor = Math.pow(PUCK_FRICTION, dt);
+		this.interpPuck.x += state.puck.vx * frictionFactor * dt;
+		this.interpPuck.y += state.puck.vy * frictionFactor * dt;
+
+		const correctionRate = 0.15;
+		const targetX = state.puck.x + state.puck.vx * timeSinceState;
+		const targetY = state.puck.y + state.puck.vy * timeSinceState;
+		this.interpPuck.x += (targetX - this.interpPuck.x) * correctionRate;
+		this.interpPuck.y += (targetY - this.interpPuck.y) * correctionRate;
+	}
+
+	private interpolateOpponent(state: GameState, timeSinceState: number) {
+		const opponentCurr = this.isHost ? state.guestPaddle : state.hostPaddle;
+
+		if (this.prevState) {
+			const opponentPrev = this.isHost ? this.prevState.guestPaddle : this.prevState.hostPaddle;
+			const interval = this.stateTimestamp - this.prevStateTimestamp;
+			const t = interval > 0 ? Math.min(timeSinceState / (interval / 1000), 1.5) : 1;
+
+			this.interpOpponent.x = opponentPrev.x + (opponentCurr.x - opponentPrev.x) * t;
+			this.interpOpponent.y = opponentPrev.y + (opponentCurr.y - opponentPrev.y) * t;
+		} else {
+			this.interpOpponent.x = opponentCurr.x;
+			this.interpOpponent.y = opponentCurr.y;
+		}
+	}
+
 	update() {
 		const now = performance.now();
 		const dt = Math.min((now - this.lastFrameTime) / 1000, 0.05);
@@ -262,9 +300,12 @@ export class PlayScene extends Phaser.Scene {
 		if (!this.latestState) return;
 
 		const state = this.latestState;
+		const timeSinceState = (now - this.stateTimestamp) / 1000;
 
 		if (this.prevStatus !== null && this.prevStatus !== 'playing' && state.status === 'playing') {
 			this.graceUntil = now + TICK_MS * 12;
+			this.interpPuck.x = state.puck.x;
+			this.interpPuck.y = state.puck.y;
 		}
 		this.prevStatus = state.status;
 
@@ -298,35 +339,49 @@ export class PlayScene extends Phaser.Scene {
 			this.localPaddle.x = clamped.x;
 			this.localPaddle.y = clamped.y;
 
-			this.socket.volatile.emit('paddleMove', {
-				x: this.pointerInput.x,
-				y: this.pointerInput.y
-			});
+			if (now - this.lastPaddleSendTime >= NETWORK_MS) {
+				this.lastPaddleSendTime = now;
+				this.socket.volatile.emit('paddleMove', {
+					x: this.pointerInput.x,
+					y: this.pointerInput.y
+				});
+			}
 		}
 
 		const puckVisible = state.status === 'playing' || state.status === 'countdown' || state.status === 'paused';
 		this.puckSprite.setVisible(puckVisible);
 		this.puckGlow.setVisible(puckVisible);
 
-		this.setPuckPosition(state.puck.x, state.puck.y);
+		if (useServerPosition) {
+			this.interpPuck.x = state.puck.x;
+			this.interpPuck.y = state.puck.y;
+		} else {
+			this.interpolatePuck(state, dt, timeSinceState);
+		}
+		this.setPuckPosition(this.interpPuck.x, this.interpPuck.y);
 
 		const myServerPos = this.isHost ? state.hostPaddle : state.guestPaddle;
-		const opponentServerPos = this.isHost ? state.guestPaddle : state.hostPaddle;
-
 		const useLocal = this.pointerInput.active && !useServerPosition;
+
+		if (useServerPosition) {
+			this.interpOpponent.x = (this.isHost ? state.guestPaddle : state.hostPaddle).x;
+			this.interpOpponent.y = (this.isHost ? state.guestPaddle : state.hostPaddle).y;
+		} else {
+			this.interpolateOpponent(state, timeSinceState);
+		}
 
 		if (this.isHost) {
 			this.setHostPaddlePosition(
 				useLocal ? this.localPaddle.x : myServerPos.x,
 				useLocal ? this.localPaddle.y : myServerPos.y
 			);
-			this.setGuestPaddlePosition(opponentServerPos.x, opponentServerPos.y);
+			this.setGuestPaddlePosition(this.interpOpponent.x, this.interpOpponent.y);
 		} else {
 			this.setGuestPaddlePosition(
 				useLocal ? this.localPaddle.x : myServerPos.x,
 				useLocal ? this.localPaddle.y : myServerPos.y
 			);
-			this.setHostPaddlePosition(opponentServerPos.x, opponentServerPos.y);
+			this.setHostPaddlePosition(this.interpOpponent.x, this.interpOpponent.y);
 		}
 
 		if (useServerPosition) {

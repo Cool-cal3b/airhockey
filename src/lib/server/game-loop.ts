@@ -8,6 +8,8 @@ import {
 	PUCK_FRICTION,
 	PADDLE_MAX_SPEED,
 	TICK_MS,
+	TICK_RATE,
+	NETWORK_RATE,
 	COUNTDOWN_SECONDS,
 	GOAL_RESET_DELAY_MS
 } from '$lib/game/constants.js';
@@ -47,6 +49,8 @@ export class GameSession {
 	private pushingPaddles = false;
 	private resetGraceTicks = 0;
 	private statusBeforePause: GameState['status'] | null = null;
+	private tickCount = 0;
+	private networkEveryNTicks = Math.round(TICK_RATE / NETWORK_RATE);
 
 	constructor(maxScore: number, callbacks: GameEventCallback) {
 		this.maxScore = maxScore;
@@ -75,14 +79,22 @@ export class GameSession {
 		this.interval = setInterval(() => this.tick(), TICK_MS);
 	}
 
+	private shouldSendNetwork(): boolean {
+		return this.tickCount % this.networkEveryNTicks === 0;
+	}
+
 	private tick() {
+		this.tickCount++;
+
 		if (this.status === 'playing') {
 			this.elapsedMs += TICK_MS;
 		}
 
 		if (this.pushingPaddles) {
 			this.pushPaddlesOutOfCenter();
-			this.callbacks.onStateUpdate(this.getState());
+			if (this.shouldSendNetwork()) {
+				this.callbacks.onStateUpdate(this.getState());
+			}
 			return;
 		}
 
@@ -93,7 +105,9 @@ export class GameSession {
 
 		if (this.resetGraceTicks > 0) {
 			this.resetGraceTicks--;
-			this.callbacks.onStateUpdate(this.getState());
+			if (this.shouldSendNetwork()) {
+				this.callbacks.onStateUpdate(this.getState());
+			}
 			return;
 		}
 
@@ -135,7 +149,9 @@ export class GameSession {
 			}
 		}
 
-		this.callbacks.onStateUpdate(this.getState());
+		if (this.shouldSendNetwork()) {
+			this.callbacks.onStateUpdate(this.getState());
+		}
 	}
 
 	private isPaddleInCenter(paddle: { x: number; y: number }): boolean {
