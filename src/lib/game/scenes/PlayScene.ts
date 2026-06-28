@@ -359,9 +359,9 @@ export class PlayScene extends Phaser.Scene {
 
 			if (now - this.lastPaddleSendTime >= NETWORK_MS) {
 				this.lastPaddleSendTime = now;
-				this.socket.volatile.emit('paddleMove', {
-					x: this.pointerInput.x,
-					y: this.pointerInput.y
+				this.socket.emit('paddleMove', {
+					x: this.localPaddle.x,
+					y: this.localPaddle.y
 				});
 			}
 		}
