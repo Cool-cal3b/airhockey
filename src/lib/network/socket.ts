@@ -15,7 +15,7 @@ let socket: GameSocket | null = null;
 
 export function getSocket(): GameSocket {
 	if (!socket) {
-		socket = io({ autoConnect: false });
+		socket = io({ autoConnect: false, transports: ['websocket'] });
 	}
 	return socket;
 }

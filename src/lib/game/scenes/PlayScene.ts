@@ -5,7 +5,6 @@ import {
 	CANVAS_PADDING,
 	PADDLE_RADIUS,
 	PUCK_RADIUS,
-	PUCK_FRICTION,
 	GOAL_WIDTH,
 	CENTER_CIRCLE_RADIUS,
 	CORNER_RADIUS,
@@ -43,19 +42,15 @@ export class PlayScene extends Phaser.Scene {
 	private countdownText!: Phaser.GameObjects.Text;
 	private goalText!: Phaser.GameObjects.Text;
 
-	private latestState: GameState | null = null;
-	private prevState: GameState | null = null;
-	private stateTimestamp = 0;
-	private prevStateTimestamp = 0;
+	private snapshotBuffer: Array<{ receivedAt: number; state: GameState }> = [];
+	private readonly INTERP_DELAY_MS = 80;
+	private readonly MAX_BUFFER_MS = 500;
 
 	private localPaddle = { x: 0, y: 0 };
 	private lastFrameTime = 0;
 	private lastPaddleSendTime = 0;
 	private prevStatus: GameState['status'] | null = null;
 	private graceUntil = 0;
-
-	private interpPuck = { x: 0, y: 0 };
-	private interpOpponent = { x: 0, y: 0 };
 
 	private scoreCallback?: (host: number, guest: number) => void;
 	private statusCallback?: (status: GameState['status']) => void;
@@ -207,10 +202,13 @@ export class PlayScene extends Phaser.Scene {
 
 	private setupSocketListeners() {
 		this.socket.on('gameState', (state: GameState) => {
-			this.prevState = this.latestState;
-			this.prevStateTimestamp = this.stateTimestamp;
-			this.latestState = state;
-			this.stateTimestamp = performance.now();
+			const now = performance.now();
+			this.snapshotBuffer.push({ receivedAt: now, state });
+
+			const cutoff = now - this.MAX_BUFFER_MS;
+			while (this.snapshotBuffer.length > 2 && this.snapshotBuffer[0].receivedAt < cutoff) {
+				this.snapshotBuffer.shift();
+			}
 
 			this.scoreCallback?.(state.score.host, state.score.guest);
 			this.statusCallback?.(state.status);
@@ -264,32 +262,53 @@ export class PlayScene extends Phaser.Scene {
 		};
 	}
 
-	private interpolatePuck(state: GameState, dt: number, timeSinceState: number) {
-		const frictionFactor = Math.pow(PUCK_FRICTION, dt);
-		this.interpPuck.x += state.puck.vx * frictionFactor * dt;
-		this.interpPuck.y += state.puck.vy * frictionFactor * dt;
+	private getInterpFrame(now: number): { from: GameState; to: GameState; t: number } | null {
+		const buf = this.snapshotBuffer;
+		if (buf.length === 0) return null;
 
-		const correctionRate = 0.15;
-		const targetX = state.puck.x + state.puck.vx * timeSinceState;
-		const targetY = state.puck.y + state.puck.vy * timeSinceState;
-		this.interpPuck.x += (targetX - this.interpPuck.x) * correctionRate;
-		this.interpPuck.y += (targetY - this.interpPuck.y) * correctionRate;
+		const renderTime = now - this.INTERP_DELAY_MS;
+		const latest = buf[buf.length - 1].state;
+
+		if (buf.length === 1 || renderTime >= buf[buf.length - 1].receivedAt) {
+			return { from: latest, to: latest, t: 0 };
+		}
+		if (renderTime <= buf[0].receivedAt) {
+			return { from: buf[0].state, to: buf[0].state, t: 0 };
+		}
+
+		for (let i = buf.length - 1; i > 0; i--) {
+			const cur = buf[i];
+			const prev = buf[i - 1];
+			if (prev.receivedAt <= renderTime && renderTime <= cur.receivedAt) {
+				const span = cur.receivedAt - prev.receivedAt;
+				const t = span > 0 ? (renderTime - prev.receivedAt) / span : 0;
+				return { from: prev.state, to: cur.state, t };
+			}
+		}
+		return { from: latest, to: latest, t: 0 };
 	}
 
-	private interpolateOpponent(state: GameState, timeSinceState: number) {
-		const opponentCurr = this.isHost ? state.guestPaddle : state.hostPaddle;
-
-		if (this.prevState) {
-			const opponentPrev = this.isHost ? this.prevState.guestPaddle : this.prevState.hostPaddle;
-			const interval = this.stateTimestamp - this.prevStateTimestamp;
-			const t = interval > 0 ? Math.min(timeSinceState / (interval / 1000), 1.5) : 1;
-
-			this.interpOpponent.x = opponentPrev.x + (opponentCurr.x - opponentPrev.x) * t;
-			this.interpOpponent.y = opponentPrev.y + (opponentCurr.y - opponentPrev.y) * t;
-		} else {
-			this.interpOpponent.x = opponentCurr.x;
-			this.interpOpponent.y = opponentCurr.y;
+	private lerpPuck(frame: { from: GameState; to: GameState; t: number }) {
+		// Status boundaries (goal reset, countdown end) teleport the puck — snap instead of lerping.
+		if (frame.from.status !== frame.to.status) {
+			return { x: frame.to.puck.x, y: frame.to.puck.y };
 		}
+		return {
+			x: frame.from.puck.x + (frame.to.puck.x - frame.from.puck.x) * frame.t,
+			y: frame.from.puck.y + (frame.to.puck.y - frame.from.puck.y) * frame.t
+		};
+	}
+
+	private lerpOpponent(frame: { from: GameState; to: GameState; t: number }) {
+		const from = this.isHost ? frame.from.guestPaddle : frame.from.hostPaddle;
+		const to = this.isHost ? frame.to.guestPaddle : frame.to.hostPaddle;
+		if (frame.from.status !== frame.to.status) {
+			return { x: to.x, y: to.y };
+		}
+		return {
+			x: from.x + (to.x - from.x) * frame.t,
+			y: from.y + (to.y - from.y) * frame.t
+		};
 	}
 
 	update() {
@@ -297,19 +316,18 @@ export class PlayScene extends Phaser.Scene {
 		const dt = Math.min((now - this.lastFrameTime) / 1000, 0.05);
 		this.lastFrameTime = now;
 
-		if (!this.latestState) return;
+		if (this.snapshotBuffer.length === 0) return;
 
-		const state = this.latestState;
-		const timeSinceState = (now - this.stateTimestamp) / 1000;
+		const latest = this.snapshotBuffer[this.snapshotBuffer.length - 1].state;
+		const frame = this.getInterpFrame(now);
+		if (!frame) return;
 
-		if (this.prevStatus !== null && this.prevStatus !== 'playing' && state.status === 'playing') {
+		if (this.prevStatus !== null && this.prevStatus !== 'playing' && latest.status === 'playing') {
 			this.graceUntil = now + TICK_MS * 12;
-			this.interpPuck.x = state.puck.x;
-			this.interpPuck.y = state.puck.y;
 		}
-		this.prevStatus = state.status;
+		this.prevStatus = latest.status;
 
-		const useServerPosition = state.status === 'goal' || state.status === 'countdown' || state.status === 'paused';
+		const useServerPosition = latest.status === 'goal' || latest.status === 'countdown' || latest.status === 'paused';
 		const inGrace = now < this.graceUntil;
 
 		if (this.pointerInput.active && !useServerPosition) {
@@ -348,40 +366,29 @@ export class PlayScene extends Phaser.Scene {
 			}
 		}
 
-		const puckVisible = state.status === 'playing' || state.status === 'countdown' || state.status === 'paused';
+		const puckVisible = latest.status === 'playing' || latest.status === 'countdown' || latest.status === 'paused';
 		this.puckSprite.setVisible(puckVisible);
 		this.puckGlow.setVisible(puckVisible);
 
-		if (useServerPosition) {
-			this.interpPuck.x = state.puck.x;
-			this.interpPuck.y = state.puck.y;
-		} else {
-			this.interpolatePuck(state, dt, timeSinceState);
-		}
-		this.setPuckPosition(this.interpPuck.x, this.interpPuck.y);
+		const puckPos = this.lerpPuck(frame);
+		this.setPuckPosition(puckPos.x, puckPos.y);
 
-		const myServerPos = this.isHost ? state.hostPaddle : state.guestPaddle;
+		const oppPos = this.lerpOpponent(frame);
+		const myServerPos = this.isHost ? latest.hostPaddle : latest.guestPaddle;
 		const useLocal = this.pointerInput.active && !useServerPosition;
-
-		if (useServerPosition) {
-			this.interpOpponent.x = (this.isHost ? state.guestPaddle : state.hostPaddle).x;
-			this.interpOpponent.y = (this.isHost ? state.guestPaddle : state.hostPaddle).y;
-		} else {
-			this.interpolateOpponent(state, timeSinceState);
-		}
 
 		if (this.isHost) {
 			this.setHostPaddlePosition(
 				useLocal ? this.localPaddle.x : myServerPos.x,
 				useLocal ? this.localPaddle.y : myServerPos.y
 			);
-			this.setGuestPaddlePosition(this.interpOpponent.x, this.interpOpponent.y);
+			this.setGuestPaddlePosition(oppPos.x, oppPos.y);
 		} else {
 			this.setGuestPaddlePosition(
 				useLocal ? this.localPaddle.x : myServerPos.x,
 				useLocal ? this.localPaddle.y : myServerPos.y
 			);
-			this.setHostPaddlePosition(this.interpOpponent.x, this.interpOpponent.y);
+			this.setHostPaddlePosition(oppPos.x, oppPos.y);
 		}
 
 		if (useServerPosition) {
