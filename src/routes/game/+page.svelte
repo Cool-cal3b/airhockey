@@ -140,6 +140,9 @@
 		socket.on('gameOver', (data) => {
 			hostScore = data.hostScore;
 			guestScore = data.guestScore;
+			// The final 'ended' gameState snapshot is sent volatile and may be dropped, so
+			// derive the end-of-game state from this reliable event instead.
+			status = 'ended';
 			clearSession();
 		});
 
