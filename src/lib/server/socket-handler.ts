@@ -230,7 +230,7 @@ export function setupSocketIO(server: HttpServer) {
 
 			const session = new GameSession(room.maxScore, {
 				onStateUpdate: (state) => {
-					io.to(roomId).emit('gameState', state);
+					io.to(roomId).volatile.emit('gameState', state);
 				},
 				onCountdown: (seconds) => {
 					io.to(roomId).emit('countdown', { seconds });
@@ -250,6 +250,8 @@ export function setupSocketIO(server: HttpServer) {
 		});
 
 		socket.on('paddleMove', (data) => {
+			if (!Number.isFinite(data?.x) || !Number.isFinite(data?.y)) return;
+
 			const roomId = socketToRoom.get(socket.id);
 			if (!roomId) return;
 			const room = rooms.get(roomId);
@@ -258,6 +260,9 @@ export function setupSocketIO(server: HttpServer) {
 			if (!session) return;
 
 			const isHost = socket.id === room.hostId;
+			const isGuest = socket.id === room.guestId;
+			if (!isHost && !isGuest) return;
+
 			session.setPaddlePosition(isHost, data.x, data.y);
 		});
 

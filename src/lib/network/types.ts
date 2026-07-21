@@ -37,6 +37,8 @@ export interface RoomListEntry {
 }
 
 export interface GameState {
+	sequence: number;
+	serverTime: number;
 	puck: { x: number; y: number; vx: number; vy: number };
 	hostPaddle: { x: number; y: number };
 	guestPaddle: { x: number; y: number };

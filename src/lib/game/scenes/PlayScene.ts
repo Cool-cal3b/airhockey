@@ -12,7 +12,7 @@ import {
 	GOAL_X_MAX,
 	PADDLE_MAX_SPEED,
 	TICK_MS,
-	NETWORK_MS
+	INPUT_MS
 } from '../constants.js';
 import { clampPaddleToHalf } from '../physics.js';
 import { PointerInput } from '../input.js';
@@ -22,6 +22,13 @@ import type { GameState } from '$lib/network/types.js';
 function hexToNum(hex: string): number {
 	return parseInt(hex.replace('#', ''), 16);
 }
+
+type InterpFrame = {
+	from: GameState;
+	to: GameState;
+	t: number;
+	extrapolationMs: number;
+};
 
 export class PlayScene extends Phaser.Scene {
 	private socket!: GameSocket;
@@ -43,8 +50,11 @@ export class PlayScene extends Phaser.Scene {
 	private goalText!: Phaser.GameObjects.Text;
 
 	private snapshotBuffer: Array<{ receivedAt: number; state: GameState }> = [];
-	private readonly INTERP_DELAY_MS = 80;
+	private readonly INTERP_DELAY_MS = 50;
+	private readonly MAX_EXTRAPOLATION_MS = 50;
 	private readonly MAX_BUFFER_MS = 500;
+	private serverClockOffset: number | null = null;
+	private lastSequence = -1;
 
 	private localPaddle = { x: 0, y: 0 };
 	private lastFrameTime = 0;
@@ -55,6 +65,22 @@ export class PlayScene extends Phaser.Scene {
 	private scoreCallback?: (host: number, guest: number) => void;
 	private statusCallback?: (status: GameState['status']) => void;
 	private elapsedCallback?: (ms: number) => void;
+
+	// Cached UI values so reactive Svelte updates only fire when a value changes.
+	private lastUiHostScore = -1;
+	private lastUiGuestScore = -1;
+	private lastUiStatus: GameState['status'] | null = null;
+	private lastUiElapsedSecond = -1;
+
+	// Dev-only realtime diagnostics, logged once per second.
+	private diagnostics = {
+		received: 0,
+		missingSequences: 0,
+		extrapolatedFrames: 0,
+		largestArrivalGap: 0,
+		lastArrivalAt: 0
+	};
+	private lastDiagnosticsLogAt = 0;
 
 	constructor() {
 		super({ key: 'PlayScene' });
@@ -201,48 +227,91 @@ export class PlayScene extends Phaser.Scene {
 	}
 
 	private setupSocketListeners() {
-		this.socket.on('gameState', (state: GameState) => {
-			const now = performance.now();
-			this.snapshotBuffer.push({ receivedAt: now, state });
-
-			const cutoff = now - this.MAX_BUFFER_MS;
-			while (this.snapshotBuffer.length > 2 && this.snapshotBuffer[0].receivedAt < cutoff) {
-				this.snapshotBuffer.shift();
-			}
-
-			this.scoreCallback?.(state.score.host, state.score.guest);
-			this.statusCallback?.(state.status);
-			this.elapsedCallback?.(state.elapsedMs);
-		});
-
-		this.socket.on('countdown', (data) => {
-			this.countdownText.setText(String(data.seconds));
-			this.countdownText.setAlpha(1);
-			this.tweens.add({
-				targets: this.countdownText,
-				scaleX: 1.5,
-				scaleY: 1.5,
-				alpha: 0,
-				duration: 800,
-				ease: 'Power2',
-				onComplete: () => {
-					this.countdownText.setScale(1);
-				}
-			});
-		});
-
-		this.socket.on('goalScored', () => {
-			this.goalText.setAlpha(1).setScale(0.5);
-			this.tweens.add({
-				targets: this.goalText,
-				scaleX: 1.2,
-				scaleY: 1.2,
-				alpha: 0,
-				duration: 1200,
-				ease: 'Power2'
-			});
-		});
+		this.socket.on('gameState', this.onGameState);
+		this.socket.on('countdown', this.onCountdown);
+		this.socket.on('goalScored', this.onGoalScored);
 	}
+
+	private onGameState = (state: GameState) => {
+		// Discard old or duplicated snapshots (volatile transport may reorder).
+		if (state.sequence <= this.lastSequence) return;
+
+		const now = performance.now();
+
+		if (this.lastSequence >= 0 && state.sequence > this.lastSequence + 1) {
+			this.diagnostics.missingSequences += state.sequence - this.lastSequence - 1;
+		}
+		if (this.diagnostics.lastArrivalAt > 0) {
+			const gap = now - this.diagnostics.lastArrivalAt;
+			this.diagnostics.largestArrivalGap = Math.max(this.diagnostics.largestArrivalGap, gap);
+		}
+		this.diagnostics.lastArrivalAt = now;
+		this.diagnostics.received++;
+
+		this.lastSequence = state.sequence;
+
+		// The smallest observed offset is the sample least inflated by network delay.
+		const offsetSample = now - state.serverTime;
+		if (this.serverClockOffset === null || offsetSample < this.serverClockOffset) {
+			this.serverClockOffset = offsetSample;
+		}
+
+		this.snapshotBuffer.push({ receivedAt: now, state });
+
+		const cutoffServerTime = state.serverTime - this.MAX_BUFFER_MS;
+		while (
+			this.snapshotBuffer.length > 2 &&
+			this.snapshotBuffer[0].state.serverTime < cutoffServerTime
+		) {
+			this.snapshotBuffer.shift();
+		}
+
+		// Only push reactive UI updates when a displayed value actually changes.
+		if (state.score.host !== this.lastUiHostScore || state.score.guest !== this.lastUiGuestScore) {
+			this.lastUiHostScore = state.score.host;
+			this.lastUiGuestScore = state.score.guest;
+			this.scoreCallback?.(state.score.host, state.score.guest);
+		}
+
+		if (state.status !== this.lastUiStatus) {
+			this.lastUiStatus = state.status;
+			this.statusCallback?.(state.status);
+		}
+
+		const elapsedSecond = Math.floor(state.elapsedMs / 1000);
+		if (elapsedSecond !== this.lastUiElapsedSecond) {
+			this.lastUiElapsedSecond = elapsedSecond;
+			this.elapsedCallback?.(state.elapsedMs);
+		}
+	};
+
+	private onCountdown = (data: { seconds: number }) => {
+		this.countdownText.setText(String(data.seconds));
+		this.countdownText.setAlpha(1);
+		this.tweens.add({
+			targets: this.countdownText,
+			scaleX: 1.5,
+			scaleY: 1.5,
+			alpha: 0,
+			duration: 800,
+			ease: 'Power2',
+			onComplete: () => {
+				this.countdownText.setScale(1);
+			}
+		});
+	};
+
+	private onGoalScored = () => {
+		this.goalText.setAlpha(1).setScale(0.5);
+		this.tweens.add({
+			targets: this.goalText,
+			scaleX: 1.2,
+			scaleY: 1.2,
+			alpha: 0,
+			duration: 1200,
+			ease: 'Power2'
+		});
+	};
 
 	private pushOutOfCenter(x: number, y: number): { x: number; y: number } {
 		const cx = RINK_WIDTH / 2;
@@ -262,33 +331,55 @@ export class PlayScene extends Phaser.Scene {
 		};
 	}
 
-	private getInterpFrame(now: number): { from: GameState; to: GameState; t: number } | null {
-		const buf = this.snapshotBuffer;
-		if (buf.length === 0) return null;
+	private getInterpFrame(now: number): InterpFrame | null {
+		const buffer = this.snapshotBuffer;
+		if (buffer.length === 0 || this.serverClockOffset === null) return null;
 
-		const renderTime = now - this.INTERP_DELAY_MS;
-		const latest = buf[buf.length - 1].state;
+		// Convert the local monotonic clock into estimated server simulation time.
+		const renderServerTime = now - this.serverClockOffset - this.INTERP_DELAY_MS;
+		const first = buffer[0].state;
+		const latest = buffer[buffer.length - 1].state;
 
-		if (buf.length === 1 || renderTime >= buf[buf.length - 1].receivedAt) {
-			return { from: latest, to: latest, t: 0 };
+		if (renderServerTime <= first.serverTime) {
+			return { from: first, to: first, t: 0, extrapolationMs: 0 };
 		}
-		if (renderTime <= buf[0].receivedAt) {
-			return { from: buf[0].state, to: buf[0].state, t: 0 };
+
+		if (renderServerTime >= latest.serverTime) {
+			return {
+				from: latest,
+				to: latest,
+				t: 0,
+				extrapolationMs: Math.min(
+					renderServerTime - latest.serverTime,
+					this.MAX_EXTRAPOLATION_MS
+				)
+			};
 		}
 
-		for (let i = buf.length - 1; i > 0; i--) {
-			const cur = buf[i];
-			const prev = buf[i - 1];
-			if (prev.receivedAt <= renderTime && renderTime <= cur.receivedAt) {
-				const span = cur.receivedAt - prev.receivedAt;
-				const t = span > 0 ? (renderTime - prev.receivedAt) / span : 0;
-				return { from: prev.state, to: cur.state, t };
+		for (let i = buffer.length - 1; i > 0; i--) {
+			const previous = buffer[i - 1].state;
+			const current = buffer[i].state;
+
+			if (previous.serverTime <= renderServerTime && renderServerTime <= current.serverTime) {
+				const span = current.serverTime - previous.serverTime;
+				const t = span > 0 ? (renderServerTime - previous.serverTime) / span : 0;
+				return { from: previous, to: current, t, extrapolationMs: 0 };
 			}
 		}
-		return { from: latest, to: latest, t: 0 };
+
+		return { from: latest, to: latest, t: 0, extrapolationMs: 0 };
 	}
 
-	private lerpPuck(frame: { from: GameState; to: GameState; t: number }) {
+	private lerpPuck(frame: InterpFrame) {
+		// Short extrapolation covers late snapshots so the puck keeps moving.
+		if (frame.extrapolationMs > 0 && frame.to.status === 'playing') {
+			const seconds = frame.extrapolationMs / 1000;
+			return {
+				x: frame.to.puck.x + frame.to.puck.vx * seconds,
+				y: frame.to.puck.y + frame.to.puck.vy * seconds
+			};
+		}
+
 		// Status boundaries (goal reset, countdown end) teleport the puck — snap instead of lerping.
 		if (frame.from.status !== frame.to.status) {
 			return { x: frame.to.puck.x, y: frame.to.puck.y };
@@ -299,7 +390,7 @@ export class PlayScene extends Phaser.Scene {
 		};
 	}
 
-	private lerpOpponent(frame: { from: GameState; to: GameState; t: number }) {
+	private lerpOpponent(frame: InterpFrame) {
 		const from = this.isHost ? frame.from.guestPaddle : frame.from.hostPaddle;
 		const to = this.isHost ? frame.to.guestPaddle : frame.to.hostPaddle;
 		if (frame.from.status !== frame.to.status) {
@@ -321,6 +412,9 @@ export class PlayScene extends Phaser.Scene {
 		const latest = this.snapshotBuffer[this.snapshotBuffer.length - 1].state;
 		const frame = this.getInterpFrame(now);
 		if (!frame) return;
+
+		if (frame.extrapolationMs > 0) this.diagnostics.extrapolatedFrames++;
+		if (import.meta.env.DEV) this.logDiagnostics(now);
 
 		if (this.prevStatus !== null && this.prevStatus !== 'playing' && latest.status === 'playing') {
 			this.graceUntil = now + TICK_MS * 12;
@@ -357,9 +451,9 @@ export class PlayScene extends Phaser.Scene {
 			this.localPaddle.x = clamped.x;
 			this.localPaddle.y = clamped.y;
 
-			if (now - this.lastPaddleSendTime >= NETWORK_MS) {
+			if (now - this.lastPaddleSendTime >= INPUT_MS) {
 				this.lastPaddleSendTime = now;
-				this.socket.emit('paddleMove', {
+				this.socket.volatile.emit('paddleMove', {
 					x: this.localPaddle.x,
 					y: this.localPaddle.y
 				});
@@ -414,10 +508,32 @@ export class PlayScene extends Phaser.Scene {
 		this.guestPaddleRing.setPosition(x, y);
 	}
 
+	private logDiagnostics(now: number) {
+		if (this.lastDiagnosticsLogAt === 0) {
+			this.lastDiagnosticsLogAt = now;
+			return;
+		}
+		if (now - this.lastDiagnosticsLogAt < 1000) return;
+
+		const d = this.diagnostics;
+		// eslint-disable-next-line no-console
+		console.log(
+			`[net] snapshots/s=${d.received} missing=${d.missingSequences} ` +
+				`extrapolatedFrames=${d.extrapolatedFrames} ` +
+				`largestGap=${d.largestArrivalGap.toFixed(1)}ms interpDelay=${this.INTERP_DELAY_MS}ms`
+		);
+
+		d.received = 0;
+		d.missingSequences = 0;
+		d.extrapolatedFrames = 0;
+		d.largestArrivalGap = 0;
+		this.lastDiagnosticsLogAt = now;
+	}
+
 	shutdown() {
 		this.pointerInput.detach();
-		this.socket.off('gameState');
-		this.socket.off('countdown');
-		this.socket.off('goalScored');
+		this.socket.off('gameState', this.onGameState);
+		this.socket.off('countdown', this.onCountdown);
+		this.socket.off('goalScored', this.onGoalScored);
 	}
 }

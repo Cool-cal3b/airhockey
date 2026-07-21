@@ -9,7 +9,7 @@ import {
 	PADDLE_MAX_SPEED,
 	TICK_MS,
 	TICK_RATE,
-	NETWORK_RATE,
+	SNAPSHOT_RATE,
 	COUNTDOWN_SECONDS,
 	GOAL_RESET_DELAY_MS
 } from '$lib/game/constants.js';
@@ -38,7 +38,9 @@ export class GameSession {
 	private guestTarget = { x: RINK_WIDTH / 2, y: 80 };
 	private score = { host: 0, guest: 0 };
 	private status: GameState['status'] = 'countdown';
-	private interval: ReturnType<typeof setInterval> | null = null;
+	private physicsTimer: ReturnType<typeof setTimeout> | null = null;
+	private lastLoopTime = 0;
+	private accumulatorMs = 0;
 	private countdownRemaining = COUNTDOWN_SECONDS;
 	private countdownTimer: ReturnType<typeof setTimeout> | null = null;
 	private goalResetTimer: ReturnType<typeof setTimeout> | null = null;
@@ -50,7 +52,8 @@ export class GameSession {
 	private resetGraceTicks = 0;
 	private statusBeforePause: GameState['status'] | null = null;
 	private tickCount = 0;
-	private networkEveryNTicks = Math.round(TICK_RATE / NETWORK_RATE);
+	private sequence = 0;
+	private networkEveryNTicks = Math.round(TICK_RATE / SNAPSHOT_RATE);
 
 	constructor(maxScore: number, callbacks: GameEventCallback) {
 		this.maxScore = maxScore;
@@ -76,7 +79,40 @@ export class GameSession {
 	}
 
 	private startPhysicsLoop() {
-		this.interval = setInterval(() => this.tick(), TICK_MS);
+		if (this.physicsTimer) clearTimeout(this.physicsTimer);
+		this.lastLoopTime = performance.now();
+		this.accumulatorMs = 0;
+		this.schedulePhysicsLoop();
+	}
+
+	private schedulePhysicsLoop(delayMs = TICK_MS) {
+		this.physicsTimer = setTimeout(() => this.runPhysicsLoop(), delayMs);
+	}
+
+	private runPhysicsLoop() {
+		const now = performance.now();
+		const elapsed = Math.min(now - this.lastLoopTime, 100);
+		this.lastLoopTime = now;
+		this.accumulatorMs += elapsed;
+
+		let steps = 0;
+		const maxCatchUpSteps = 5;
+
+		while (this.accumulatorMs >= TICK_MS && steps < maxCatchUpSteps) {
+			this.tick();
+			this.accumulatorMs -= TICK_MS;
+			steps++;
+		}
+
+		if (steps === maxCatchUpSteps) {
+			// Avoid a spiral of death after a heavily delayed event-loop turn.
+			this.accumulatorMs = 0;
+		}
+
+		if (this.status !== 'paused' && this.status !== 'ended') {
+			const nextDelay = Math.max(1, TICK_MS - this.accumulatorMs);
+			this.schedulePhysicsLoop(nextDelay);
+		}
 	}
 
 	private shouldSendNetwork(): boolean {
@@ -314,6 +350,8 @@ export class GameSession {
 
 	getState(): GameState {
 		return {
+			sequence: ++this.sequence,
+			serverTime: performance.now(),
 			puck: { x: this.puck.x, y: this.puck.y, vx: this.puck.vx, vy: this.puck.vy },
 			hostPaddle: { x: this.hostPaddle.x, y: this.hostPaddle.y },
 			guestPaddle: { x: this.guestPaddle.x, y: this.guestPaddle.y },
@@ -328,10 +366,11 @@ export class GameSession {
 		this.statusBeforePause = this.status;
 		this.status = 'paused';
 
-		if (this.interval) clearInterval(this.interval);
+		if (this.physicsTimer) clearTimeout(this.physicsTimer);
 		if (this.countdownTimer) clearInterval(this.countdownTimer);
 		if (this.goalResetTimer) clearTimeout(this.goalResetTimer);
-		this.interval = null;
+		this.physicsTimer = null;
+		this.accumulatorMs = 0;
 		this.countdownTimer = null;
 		this.goalResetTimer = null;
 	}
@@ -379,10 +418,11 @@ export class GameSession {
 	}
 
 	stop() {
-		if (this.interval) clearInterval(this.interval);
+		if (this.physicsTimer) clearTimeout(this.physicsTimer);
 		if (this.countdownTimer) clearInterval(this.countdownTimer);
 		if (this.goalResetTimer) clearTimeout(this.goalResetTimer);
-		this.interval = null;
+		this.physicsTimer = null;
+		this.accumulatorMs = 0;
 		this.countdownTimer = null;
 		this.goalResetTimer = null;
 	}
