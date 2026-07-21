@@ -5,8 +5,73 @@ import {
 	PUCK_RADIUS,
 	CORNER_RADIUS,
 	GOAL_X_MIN,
-	GOAL_X_MAX
+	GOAL_X_MAX,
+	PUCK_FRICTION,
+	PUCK_MAX_SPEED
 } from './constants.js';
+
+export const PUCK_SUBSTEPS = 4;
+
+type PuckState = { x: number; y: number; vx: number; vy: number };
+type PaddleState = { x: number; y: number; vx: number; vy: number };
+
+/**
+ * Advances the puck one physics tick (friction, paddle collisions, speed clamp,
+ * wall/corner containment) using fixed substeps. Shared by the authoritative
+ * server loop and the client's local prediction so both simulate identically.
+ * Returns the new puck state and which side (if any) scored during the step.
+ */
+export function stepPuck(
+	puck: PuckState,
+	hostPaddle: PaddleState,
+	guestPaddle: PaddleState,
+	dt: number,
+	substeps: number = PUCK_SUBSTEPS
+): { x: number; y: number; vx: number; vy: number; scored: 'host' | 'guest' | null } {
+	const subDt = dt / substeps;
+	const frictionFactor = Math.pow(PUCK_FRICTION, subDt);
+
+	let x = puck.x;
+	let y = puck.y;
+	let vx = puck.vx;
+	let vy = puck.vy;
+
+	for (let step = 0; step < substeps; step++) {
+		vx *= frictionFactor;
+		vy *= frictionFactor;
+
+		x += vx * subDt;
+		y += vy * subDt;
+
+		const afterHost = resolvePuckPaddleCollision({ x, y, vx, vy }, hostPaddle);
+		x = afterHost.x;
+		y = afterHost.y;
+		vx = afterHost.vx;
+		vy = afterHost.vy;
+
+		const afterGuest = resolvePuckPaddleCollision({ x, y, vx, vy }, guestPaddle);
+		x = afterGuest.x;
+		y = afterGuest.y;
+		vx = afterGuest.vx;
+		vy = afterGuest.vy;
+
+		const clamped = clampSpeed(vx, vy, PUCK_MAX_SPEED);
+		vx = clamped.vx;
+		vy = clamped.vy;
+
+		const wall = containPuckInRink(x, y, vx, vy);
+		x = wall.x;
+		y = wall.y;
+		vx = wall.vx;
+		vy = wall.vy;
+
+		if (wall.scored) {
+			return { x, y, vx, vy, scored: wall.scored };
+		}
+	}
+
+	return { x, y, vx, vy, scored: null };
+}
 
 export function resolvePuckPaddleCollision(
 	puck: { x: number; y: number; vx: number; vy: number },

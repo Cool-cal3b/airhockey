@@ -4,8 +4,6 @@ import {
 	RINK_HEIGHT,
 	PADDLE_RADIUS,
 	CENTER_CIRCLE_RADIUS,
-	PUCK_MAX_SPEED,
-	PUCK_FRICTION,
 	PADDLE_MAX_SPEED,
 	TICK_MS,
 	TICK_RATE,
@@ -14,9 +12,7 @@ import {
 	GOAL_RESET_DELAY_MS
 } from '$lib/game/constants.js';
 import {
-	resolvePuckPaddleCollision,
-	containPuckInRink,
-	clampSpeed,
+	stepPuck,
 	clampPaddleToHalf
 } from '$lib/game/physics.js';
 
@@ -27,7 +23,6 @@ export type GameEventCallback = {
 	onGameOver: (winner: 'host' | 'guest', hostScore: number, guestScore: number) => void;
 };
 
-const SUBSTEPS = 4;
 const PUSH_OUT_SPEED = 400;
 
 export class GameSession {
@@ -147,42 +142,15 @@ export class GameSession {
 			return;
 		}
 
-		const subDt = this.dt / SUBSTEPS;
+		const result = stepPuck(this.puck, this.hostPaddle, this.guestPaddle, this.dt);
+		this.puck.x = result.x;
+		this.puck.y = result.y;
+		this.puck.vx = result.vx;
+		this.puck.vy = result.vy;
 
-		for (let step = 0; step < SUBSTEPS; step++) {
-			const frictionFactor = Math.pow(PUCK_FRICTION, subDt);
-			this.puck.vx *= frictionFactor;
-			this.puck.vy *= frictionFactor;
-
-			this.puck.x += this.puck.vx * subDt;
-			this.puck.y += this.puck.vy * subDt;
-
-			const afterHost = resolvePuckPaddleCollision(this.puck, this.hostPaddle);
-			this.puck.x = afterHost.x;
-			this.puck.y = afterHost.y;
-			this.puck.vx = afterHost.vx;
-			this.puck.vy = afterHost.vy;
-
-			const afterGuest = resolvePuckPaddleCollision(this.puck, this.guestPaddle);
-			this.puck.x = afterGuest.x;
-			this.puck.y = afterGuest.y;
-			this.puck.vx = afterGuest.vx;
-			this.puck.vy = afterGuest.vy;
-
-			const clamped = clampSpeed(this.puck.vx, this.puck.vy, PUCK_MAX_SPEED);
-			this.puck.vx = clamped.vx;
-			this.puck.vy = clamped.vy;
-
-			const wall = containPuckInRink(this.puck.x, this.puck.y, this.puck.vx, this.puck.vy);
-			this.puck.x = wall.x;
-			this.puck.y = wall.y;
-			this.puck.vx = wall.vx;
-			this.puck.vy = wall.vy;
-
-			if (wall.scored) {
-				this.handleGoal(wall.scored);
-				return;
-			}
+		if (result.scored) {
+			this.handleGoal(result.scored);
+			return;
 		}
 
 		if (this.shouldSendNetwork()) {
