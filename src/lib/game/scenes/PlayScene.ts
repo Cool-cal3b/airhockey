@@ -111,6 +111,17 @@ export class PlayScene extends Phaser.Scene {
 	create() {
 		this.cameras.main.setScroll(-CANVAS_PADDING, -CANVAS_PADDING);
 
+		// The server simulates in canonical coordinates: the host defends the bottom
+		// goal, the guest defends the top. Rendered as-is, the guest would always play
+		// from the top — a harder, unnatural viewpoint. The camera's rotation pivot is
+		// the rink center (200, 350), so rotating the guest's camera 180° maps every
+		// point (x, y) -> (RINK_WIDTH - x, RINK_HEIGHT - y), putting the guest's own
+		// paddle and goal at the bottom of *their* screen. Networking stays canonical;
+		// only this client's view flips.
+		if (!this.isHost) {
+			this.cameras.main.setRotation(Math.PI);
+		}
+
 		this.pointerInput = new PointerInput(RINK_WIDTH, RINK_HEIGHT, CANVAS_PADDING);
 		this.pointerInput.attach(this.game.canvas);
 		this.lastFrameTime = performance.now();
@@ -224,6 +235,13 @@ export class PlayScene extends Phaser.Scene {
 			color: '#00ff88',
 			align: 'center'
 		}).setOrigin(0.5).setAlpha(0);
+
+		// These sit on the camera's rotation pivot, so the guest's 180° camera flip would
+		// render them upside down. Counter-rotate to keep the text readable for both players.
+		if (!this.isHost) {
+			this.countdownText.setRotation(Math.PI);
+			this.goalText.setRotation(Math.PI);
+		}
 	}
 
 	private setupSocketListeners() {
@@ -312,6 +330,16 @@ export class PlayScene extends Phaser.Scene {
 			ease: 'Power2'
 		});
 	};
+
+	// The guest's camera is rotated 180°, so their raw pointer (which the browser reports
+	// in unrotated canvas space) is mirrored relative to the canonical simulation. Undo the
+	// flip so paddle clamping and the coordinates sent to the server stay in canonical space.
+	private readPointerCanonical(): { x: number; y: number } {
+		if (this.isHost) {
+			return { x: this.pointerInput.x, y: this.pointerInput.y };
+		}
+		return { x: RINK_WIDTH - this.pointerInput.x, y: RINK_HEIGHT - this.pointerInput.y };
+	}
 
 	private pushOutOfCenter(x: number, y: number): { x: number; y: number } {
 		const cx = RINK_WIDTH / 2;
@@ -425,7 +453,8 @@ export class PlayScene extends Phaser.Scene {
 		const inGrace = now < this.graceUntil;
 
 		if (this.pointerInput.active && !useServerPosition) {
-			let target = clampPaddleToHalf(this.pointerInput.x, this.pointerInput.y, this.isHost);
+			const pointer = this.readPointerCanonical();
+			let target = clampPaddleToHalf(pointer.x, pointer.y, this.isHost);
 			if (inGrace) {
 				target = this.pushOutOfCenter(target.x, target.y);
 			}
