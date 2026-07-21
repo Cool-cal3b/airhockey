@@ -24,29 +24,38 @@
 
 	let container: HTMLDivElement;
 
-	onMount(async () => {
-		const Phaser = (await import('phaser')).default;
-		const { PlayScene } = await import('./scenes/PlayScene.js');
+	onMount(() => {
+		let game: import('phaser').Game | null = null;
+		let destroyed = false;
 
-		const game = new Phaser.Game({
-			type: Phaser.AUTO,
-			parent: container,
-			width: CANVAS_WIDTH,
-			height: CANVAS_HEIGHT,
-			backgroundColor: '#0a0a1a',
-			scale: {
-				mode: Phaser.Scale.FIT,
-				autoCenter: Phaser.Scale.CENTER_BOTH
-			},
-			scene: PlayScene
-		});
+		(async () => {
+			const Phaser = (await import('phaser')).default;
+			const { PlayScene } = await import('./scenes/PlayScene.js');
 
-		game.scene.start('PlayScene', {
-			socket, isHost, onScore, onStatus, onElapsed, hostColor, guestColor
-		});
+			// The component may have already unmounted while the dynamic imports resolved.
+			if (destroyed) return;
+
+			game = new Phaser.Game({
+				type: Phaser.AUTO,
+				parent: container,
+				width: CANVAS_WIDTH,
+				height: CANVAS_HEIGHT,
+				backgroundColor: '#0a0a1a',
+				scale: {
+					mode: Phaser.Scale.FIT,
+					autoCenter: Phaser.Scale.CENTER_BOTH
+				},
+				scene: PlayScene
+			});
+
+			game.scene.start('PlayScene', {
+				socket, isHost, onScore, onStatus, onElapsed, hostColor, guestColor
+			});
+		})();
 
 		return () => {
-			game.destroy(true);
+			destroyed = true;
+			game?.destroy(true);
 		};
 	});
 </script>
