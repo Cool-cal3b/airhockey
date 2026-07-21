@@ -84,6 +84,12 @@ export class PlayScene extends Phaser.Scene {
 	private lastShakeAt = 0;
 	private reducedMotion = false;
 
+	// While a goal "pop" is playing, the tween owns the puck sprite. It is driven by the
+	// reliable `goalScored` event (the single `status:'goal'` snapshot is volatile and may
+	// drop), so the puck reliably disappears on a goal. Cleared when the next round
+	// re-centres the puck.
+	private goalPopPlaying = false;
+
 	private scoreCallback?: (host: number, guest: number) => void;
 	private statusCallback?: (status: GameState['status']) => void;
 	private elapsedCallback?: (ms: number) => void;
@@ -349,6 +355,7 @@ export class PlayScene extends Phaser.Scene {
 		if (!this.reducedMotion) {
 			this.cameras.main.shake(280, 0.012);
 		}
+		this.playGoalPop();
 		this.goalText.setAlpha(1).setScale(0.5);
 		this.tweens.add({
 			targets: this.goalText,
@@ -359,6 +366,45 @@ export class PlayScene extends Phaser.Scene {
 			ease: 'Power2'
 		});
 	};
+
+	// Bursts the puck at the point it went in, then hides it until the next round.
+	private playGoalPop() {
+		if (this.goalPopPlaying) return;
+		this.goalPopPlaying = true;
+
+		const x = this.puckRenderX;
+		const y = this.puckRenderY;
+
+		this.puckSprite.setVisible(true).setPosition(x, y).setScale(1).setAlpha(1);
+		this.puckGlow.setVisible(true).setPosition(x, y).setScale(1).setAlpha(1);
+
+		this.tweens.add({
+			targets: [this.puckSprite, this.puckGlow],
+			scaleX: 1.9,
+			scaleY: 1.9,
+			alpha: 0,
+			duration: 260,
+			ease: 'Quad.easeOut',
+			onComplete: () => {
+				this.puckSprite.setVisible(false).setScale(1).setAlpha(1);
+				this.puckGlow.setVisible(false).setScale(1).setAlpha(1);
+			}
+		});
+
+		// Expanding shockwave ring in the goal-flash colour.
+		const ring = this.add.circle(x, y, PUCK_RADIUS);
+		ring.setStrokeStyle(3, 0x00ff88, 0.9);
+		ring.setFillStyle();
+		this.tweens.add({
+			targets: ring,
+			scaleX: 3.6,
+			scaleY: 3.6,
+			alpha: 0,
+			duration: 380,
+			ease: 'Cubic.easeOut',
+			onComplete: () => ring.destroy()
+		});
+	}
 
 	// The guest's camera is rotated 180°, so their raw pointer (which the browser reports
 	// in unrotated canvas space) is mirrored relative to the canonical simulation. Undo the
@@ -529,10 +575,59 @@ export class PlayScene extends Phaser.Scene {
 			this.recordPaddle(now - this.serverClockOffset, myX, myY);
 		}
 
-		const puckVisible = latest.status === 'playing' || latest.status === 'countdown' || latest.status === 'paused';
-		this.puckSprite.setVisible(puckVisible);
-		this.puckGlow.setVisible(puckVisible);
+		// A goal pop owns the puck sprite until the next round re-centres the puck.
+		if (this.goalPopPlaying) {
+			const cx = RINK_WIDTH / 2;
+			const cy = RINK_HEIGHT / 2;
+			const reset =
+				latest.status === 'playing' &&
+				Math.abs(latest.puck.x - cx) < 3 &&
+				Math.abs(latest.puck.y - cy) < 3;
+			if (reset) {
+				this.goalPopPlaying = false;
+				this.puckSprite.setScale(1).setAlpha(1);
+				this.puckGlow.setScale(1).setAlpha(1);
+				this.puckRenderX = cx;
+				this.puckRenderY = cy;
+				this.predPrevX = cx;
+				this.predPrevY = cy;
+				this.wasTouchingPuck = false;
+			}
+		}
 
+		// While a pop is playing the tween owns the puck sprite, so only render it here
+		// otherwise. Paddles are always rendered below.
+		if (!this.goalPopPlaying) {
+			const puckVisible = latest.status === 'playing' || latest.status === 'countdown' || latest.status === 'paused';
+			this.puckSprite.setVisible(puckVisible);
+			this.puckGlow.setVisible(puckVisible);
+
+			this.renderPuck(now, dt, latest, frame, myX, myY);
+		}
+
+		const oppPos = this.lerpOpponent(frame);
+		if (this.isHost) {
+			this.setHostPaddlePosition(myX, myY);
+			this.setGuestPaddlePosition(oppPos.x, oppPos.y);
+		} else {
+			this.setGuestPaddlePosition(myX, myY);
+			this.setHostPaddlePosition(oppPos.x, oppPos.y);
+		}
+
+		if (useServerPosition) {
+			this.localPaddle.x = myServerPos.x;
+			this.localPaddle.y = myServerPos.y;
+		}
+	}
+
+	private renderPuck(
+		now: number,
+		dt: number,
+		latest: GameState,
+		frame: InterpFrame,
+		myX: number,
+		myY: number
+	) {
 		if (latest.status === 'playing' && this.serverClockOffset !== null) {
 			const predicted = this.predictPuck(now, latest);
 
@@ -571,20 +666,6 @@ export class PlayScene extends Phaser.Scene {
 			this.puckInitialized = true;
 		}
 		this.setPuckPosition(this.puckRenderX, this.puckRenderY);
-
-		const oppPos = this.lerpOpponent(frame);
-		if (this.isHost) {
-			this.setHostPaddlePosition(myX, myY);
-			this.setGuestPaddlePosition(oppPos.x, oppPos.y);
-		} else {
-			this.setGuestPaddlePosition(myX, myY);
-			this.setHostPaddlePosition(oppPos.x, oppPos.y);
-		}
-
-		if (useServerPosition) {
-			this.localPaddle.x = myServerPos.x;
-			this.localPaddle.y = myServerPos.y;
-		}
 	}
 
 	// Re-simulate the puck from the latest authoritative snapshot up to the present using
