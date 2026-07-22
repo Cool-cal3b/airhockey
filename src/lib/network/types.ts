@@ -15,6 +15,23 @@ export type NeonColorId = (typeof NEON_COLORS)[number]['id'];
 
 export const RECONNECT_GRACE_MS = 30_000;
 
+export type PlayerRole = 'host' | 'guest';
+export type TransportMode = 'direct' | 'server';
+
+export interface PaddleInput {
+	sequence: number;
+	x: number;
+	y: number;
+	clientTime: number;
+}
+
+export interface PaddleState {
+	x: number;
+	y: number;
+	vx: number;
+	vy: number;
+}
+
 export interface RoomInfo {
 	id: string;
 	name: string;
@@ -38,14 +55,32 @@ export interface RoomListEntry {
 
 export interface GameState {
 	sequence: number;
+	simulationTick: number;
 	serverTime: number;
 	puck: { x: number; y: number; vx: number; vy: number };
-	hostPaddle: { x: number; y: number };
-	guestPaddle: { x: number; y: number };
+	hostPaddle: PaddleState;
+	guestPaddle: PaddleState;
+	acknowledgedInput: { host: number; guest: number };
 	score: { host: number; guest: number };
 	status: 'countdown' | 'playing' | 'goal' | 'ended' | 'paused';
 	elapsedMs: number;
 }
+
+export type ReliableGameEvent =
+	| { type: 'countdown'; seconds: number }
+	| { type: 'goal'; scorer: PlayerRole }
+	| { type: 'gameOver'; winner: PlayerRole; hostScore: number; guestScore: number }
+	| { type: 'paused' }
+	| { type: 'resumed' };
+
+export type GameMessage =
+	| { type: 'input'; role: PlayerRole; input: PaddleInput }
+	| { type: 'snapshot'; state: GameState }
+	| { type: 'event'; event: ReliableGameEvent };
+
+export type RtcSignal =
+	| { description: RTCSessionDescriptionInit }
+	| { candidate: RTCIceCandidateInit };
 
 export interface ClientToServerEvents {
 	createRoom: (data: { name: string; maxScore: number }, callback: (room: RoomInfo, token: string) => void) => void;
@@ -58,7 +93,11 @@ export interface ClientToServerEvents {
 	setName: (data: { name: string }) => void;
 	setColor: (data: { color: NeonColorId }) => void;
 	startGame: () => void;
-	paddleMove: (data: { x: number; y: number }) => void;
+	paddleMove: (data: PaddleInput) => void;
+	rtcSignal: (data: { roomId: string; signal: RtcSignal }) => void;
+	directPrepare: (data: { roomId: string }) => void;
+	directReady: (data: { roomId: string; ready: boolean }) => void;
+	timeSync: (callback: (data: { serverTime: number }) => void) => void;
 	leaveRoom: () => void;
 }
 
@@ -66,7 +105,9 @@ export interface ServerToClientEvents {
 	roomUpdated: (room: RoomInfo) => void;
 	roomClosed: () => void;
 	roomList: (rooms: RoomListEntry[]) => void;
-	gameStarted: (data: { roomId: string }) => void;
+	gameStarted: (data: { roomId: string; mode: TransportMode }) => void;
+	rtcSignal: (data: { signal: RtcSignal }) => void;
+	rtcPeerReady: () => void;
 	gameState: (state: GameState) => void;
 	countdown: (data: { seconds: number }) => void;
 	goalScored: (data: { scorer: 'host' | 'guest' }) => void;
