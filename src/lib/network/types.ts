@@ -14,6 +14,9 @@ export const NEON_COLORS = [
 export type NeonColorId = (typeof NEON_COLORS)[number]['id'];
 
 export const RECONNECT_GRACE_MS = 30_000;
+// Opening a native share sheet can suspend a mobile browser for several minutes.
+// Keep waiting rooms alive long enough for the host to send the invite and return.
+export const LOBBY_RECONNECT_GRACE_MS = 10 * 60_000;
 
 export interface RoomInfo {
 	id: string;
@@ -73,4 +76,6 @@ export interface ServerToClientEvents {
 	gameOver: (data: { winner: 'host' | 'guest'; hostScore: number; guestScore: number }) => void;
 	opponentDisconnected: (data: { graceMs: number }) => void;
 	opponentReconnected: () => void;
+	hostDisconnected: (data: { graceMs: number }) => void;
+	hostReconnected: () => void;
 }

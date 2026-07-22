@@ -6,7 +6,7 @@ import type {
 	RoomInfo,
 	RoomListEntry
 } from '$lib/network/types.js';
-import { RECONNECT_GRACE_MS } from '$lib/network/types.js';
+import { LOBBY_RECONNECT_GRACE_MS, RECONNECT_GRACE_MS } from '$lib/network/types.js';
 import { GameSession } from './game-loop.js';
 import crypto from 'crypto';
 
@@ -105,6 +105,12 @@ export function setupSocketIO(server: HttpServer) {
 
 			callback(room, guestToken);
 			io.to(room.id).emit('roomUpdated', room);
+			// The host may have disconnected before this guest joined, so the
+			// disconnect notification could have been emitted before this socket
+			// entered the room.
+			if (!io.sockets.sockets.has(room.hostId)) {
+				socket.emit('hostDisconnected', { graceMs: LOBBY_RECONNECT_GRACE_MS });
+			}
 			broadcastRoomList(io);
 		});
 
@@ -149,6 +155,8 @@ export function setupSocketIO(server: HttpServer) {
 				session.resume();
 				io.to(roomId).emit('opponentReconnected');
 				io.to(roomId).emit('gameState', session.getState());
+			} else if (role === 'host') {
+				io.to(roomId).emit('hostReconnected');
 			}
 
 			callback(room, role);
@@ -318,19 +326,23 @@ function handleLeave(
 	}
 
 	if (!session) {
-		if (isHost) {
-			cleanupTokensForRole(roomId, 'host');
-			cleanupTokensForRole(roomId, 'guest');
-			rooms.delete(roomId);
-			io.to(roomId).emit('roomClosed');
-			io.in(roomId).socketsLeave(roomId);
-		} else {
-			cleanupTokensForRole(roomId, 'guest');
-			room.guestId = null;
-			room.guestReady = false;
-			io.to(roomId).emit('roomUpdated', room);
+		// Native share sheets and app switching commonly suspend mobile browsers,
+		// which drops the socket. Preserve the lobby so the invite remains valid and
+		// let the saved session token attach the returning player to the new socket.
+		const timerKey = `${roomId}:${role}`;
+		if (!session && isHost) {
+			io.to(roomId).emit('hostDisconnected', { graceMs: LOBBY_RECONNECT_GRACE_MS });
 		}
-		broadcastRoomList(io);
+		const existingTimer = disconnectTimers.get(timerKey);
+		if (existingTimer) clearTimeout(existingTimer);
+		disconnectTimers.set(
+			timerKey,
+			setTimeout(() => {
+				disconnectTimers.delete(timerKey);
+				cleanupTokensForRole(roomId, role);
+				destroyRoom(roomId, isHost, io);
+			}, LOBBY_RECONNECT_GRACE_MS)
+		);
 	}
 }
 

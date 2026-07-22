@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { connectSocket } from '$lib/network/socket.js';
+	import { connectSocket, loadSession } from '$lib/network/socket.js';
 	import { NEON_COLORS, type RoomInfo, type NeonColorId } from '$lib/network/types.js';
 
 	const roomId = $derived(page.url.searchParams.get('roomId') ?? '');
@@ -14,6 +14,8 @@
 	let nameInput = $state('');
 	let nameSet = $state(false);
 	let copied = $state(false);
+	let hostDisconnected = $state(false);
+	let hostGraceMs = $state(0);
 
 	const shareUrl = $derived(
 		typeof window !== 'undefined'
@@ -28,6 +30,37 @@
 		return NEON_COLORS.find((c) => c.id === id)?.hex ?? '#ffffff';
 	}
 
+	function restoreRoom() {
+		const socket = connectSocket();
+		const session = loadSession();
+
+		if (session && session.roomId === roomId) {
+			socket.emit('rejoinRoom', { token: session.token }, (rejoinedRoom, role) => {
+				if (rejoinedRoom && role) {
+					room = rejoinedRoom;
+					myRole = role;
+					return;
+				}
+				fetchRoom();
+			});
+			return;
+		}
+
+		fetchRoom();
+	}
+
+	function fetchRoom() {
+		const socket = connectSocket();
+		socket.emit('getRoom', { roomId }, (fetchedRoom) => {
+			if (fetchedRoom) {
+				room = fetchedRoom;
+				socket.emit('getMyRole', { roomId }, (role) => { myRole = role; });
+			} else {
+				goto('/');
+			}
+		});
+	}
+
 	$effect(() => {
 		if (!roomId) {
 			goto('/');
@@ -39,29 +72,31 @@
 
 		socket.on('connect', () => {
 			connected = true;
-			socket.emit('getMyRole', { roomId }, (role) => { myRole = role; });
+			restoreRoom();
 		});
 		socket.on('disconnect', () => { connected = false; });
 		socket.on('roomUpdated', (updatedRoom) => { room = updatedRoom; });
+		socket.on('hostDisconnected', ({ graceMs }) => {
+			hostDisconnected = true;
+			hostGraceMs = graceMs;
+		});
+		socket.on('hostReconnected', () => {
+			hostDisconnected = false;
+		hostGraceMs = 0;
+		});
 		socket.on('roomClosed', () => { goto('/'); });
 		socket.on('gameStarted', () => {
 			goto(`/game?roomId=${roomId}`);
 		});
 
-		socket.emit('getRoom', { roomId }, (fetchedRoom) => {
-			if (fetchedRoom) {
-				room = fetchedRoom;
-			} else {
-				goto('/');
-			}
-		});
-
-		socket.emit('getMyRole', { roomId }, (role) => { myRole = role; });
+		if (socket.connected) restoreRoom();
 
 		return () => {
 			socket.off('connect');
 			socket.off('disconnect');
 			socket.off('roomUpdated');
+			socket.off('hostDisconnected');
+			socket.off('hostReconnected');
 			socket.off('roomClosed');
 			socket.off('gameStarted');
 		};
@@ -133,6 +168,13 @@
 		<button class="back-link" onclick={leaveRoom}>← Leave Room</button>
 		<h2>{gameName}</h2>
 		<p class="match-info">First to {maxScore} · Room {roomId}</p>
+
+		{#if hostDisconnected && !isHost}
+			<div class="host-reconnecting" role="status">
+				<strong>Host rejoining…</strong>
+				<span>The host is temporarily away. The room will stay open for {Math.ceil(hostGraceMs / 60000)} minutes.</span>
+			</div>
+		{/if}
 
 		<div class="players">
 			<div class="player" class:ready={hostReady} style="--player-color: {colorHex(room?.hostColor ?? 'cyan')}">
@@ -323,6 +365,27 @@
 		font-size: 0.85rem;
 		text-transform: uppercase;
 		letter-spacing: 0.15em;
+	}
+
+	.host-reconnecting {
+		width: 100%;
+		display: flex;
+		flex-direction: column;
+		gap: 0.3rem;
+		padding: 0.8rem 1rem;
+		border: 1px solid rgba(255, 196, 0, 0.55);
+		border-radius: 8px;
+		background: rgba(255, 196, 0, 0.08);
+		color: #ffd45c;
+		font-size: 0.78rem;
+		line-height: 1.4;
+		text-align: center;
+	}
+
+	.host-reconnecting strong {
+		font-size: 0.8rem;
+		text-transform: uppercase;
+		letter-spacing: 0.08em;
 	}
 
 	.players {
