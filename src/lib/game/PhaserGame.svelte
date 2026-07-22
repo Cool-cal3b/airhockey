@@ -1,11 +1,11 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { CANVAS_WIDTH, CANVAS_HEIGHT } from './constants.js';
-	import type { GameSocket } from '$lib/network/socket.js';
+	import type { GameTransport } from '$lib/network/transport.js';
 	import type { GameState } from '$lib/network/types.js';
 
 	let {
-		socket,
+		transport,
 		isHost,
 		onScore,
 		onStatus,
@@ -13,7 +13,7 @@
 		hostColor = '#00d4ff',
 		guestColor = '#ff2d7b'
 	}: {
-		socket: GameSocket;
+		transport: GameTransport;
 		isHost: boolean;
 		onScore: (host: number, guest: number) => void;
 		onStatus: (status: GameState['status']) => void;
@@ -49,7 +49,7 @@
 			});
 
 			game.scene.start('PlayScene', {
-				socket, isHost, onScore, onStatus, onElapsed, hostColor, guestColor
+				transport, isHost, onScore, onStatus, onElapsed, hostColor, guestColor
 			});
 		})();
 

@@ -4,10 +4,12 @@ import type {
 	ClientToServerEvents,
 	ServerToClientEvents,
 	RoomInfo,
-	RoomListEntry
+	RoomListEntry,
+	PlayerRole
 } from '$lib/network/types.js';
 import { RECONNECT_GRACE_MS } from '$lib/network/types.js';
-import { GameSession } from './game-loop.js';
+import { selectTransportMode } from '$lib/network/negotiation.js';
+import { GameSession } from '$lib/game/game-session.js';
 import crypto from 'crypto';
 
 const rooms = new Map<string, RoomInfo>();
@@ -17,6 +19,8 @@ const socketToRoom = new Map<string, string>();
 const tokenToRoom = new Map<string, { roomId: string; role: 'host' | 'guest' }>();
 const roomTokens = new Map<string, { hostToken: string; guestToken: string | null }>();
 const disconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const directReady = new Map<string, Set<PlayerRole>>();
+const directPrepared = new Map<string, Set<PlayerRole>>();
 
 function generateRoomId(): string {
 	return Math.random().toString(36).substring(2, 8).toUpperCase();
@@ -228,6 +232,13 @@ export function setupSocketIO(server: HttpServer) {
 			if (!room.guestId || !room.hostReady || !room.guestReady) return;
 			if (sessions.has(roomId)) return;
 
+			const ready = directReady.get(roomId);
+			const mode = selectTransportMode(ready ?? new Set<PlayerRole>());
+			if (mode === 'direct') {
+				io.to(roomId).emit('gameStarted', { roomId, mode: 'direct' });
+				return;
+			}
+
 			const session = new GameSession(room.maxScore, {
 				onStateUpdate: (state) => {
 					io.to(roomId).volatile.emit('gameState', state);
@@ -245,12 +256,50 @@ export function setupSocketIO(server: HttpServer) {
 			});
 
 			sessions.set(roomId, session);
-			io.to(roomId).emit('gameStarted', { roomId });
+			io.to(roomId).emit('gameStarted', { roomId, mode: 'server' });
 			session.start();
 		});
 
+		socket.on('rtcSignal', (data) => {
+			const roomId = socketToRoom.get(socket.id);
+			const room = roomId ? rooms.get(roomId) : null;
+			if (!room || data.roomId !== roomId) return;
+			const targetId = socket.id === room.hostId ? room.guestId : room.hostId;
+			if (targetId) io.to(targetId).emit('rtcSignal', { signal: data.signal });
+		});
+
+		socket.on('directReady', (data) => {
+			const roomId = socketToRoom.get(socket.id);
+			const room = roomId ? rooms.get(roomId) : null;
+			if (!room || data.roomId !== roomId) return;
+			const role: PlayerRole | null =
+				socket.id === room.hostId ? 'host' : socket.id === room.guestId ? 'guest' : null;
+			if (!role) return;
+			const ready = directReady.get(roomId) ?? new Set<PlayerRole>();
+			if (data.ready) ready.add(role);
+			else ready.delete(role);
+			directReady.set(roomId, ready);
+		});
+
+		socket.on('directPrepare', (data) => {
+			const roomId = socketToRoom.get(socket.id);
+			const room = roomId ? rooms.get(roomId) : null;
+			if (!room || data.roomId !== roomId) return;
+			const role: PlayerRole | null =
+				socket.id === room.hostId ? 'host' : socket.id === room.guestId ? 'guest' : null;
+			if (!role) return;
+			const prepared = directPrepared.get(roomId) ?? new Set<PlayerRole>();
+			prepared.add(role);
+			directPrepared.set(roomId, prepared);
+			if (prepared.has('host') && prepared.has('guest')) io.to(roomId).emit('rtcPeerReady');
+		});
+
+		socket.on('timeSync', (callback) => {
+			callback({ serverTime: performance.now() });
+		});
+
 		socket.on('paddleMove', (data) => {
-			if (!Number.isFinite(data?.x) || !Number.isFinite(data?.y)) return;
+			if (!Number.isFinite(data?.x) || !Number.isFinite(data?.y) || !Number.isFinite(data?.sequence)) return;
 
 			const roomId = socketToRoom.get(socket.id);
 			if (!roomId) return;
@@ -263,7 +312,7 @@ export function setupSocketIO(server: HttpServer) {
 			const isGuest = socket.id === room.guestId;
 			if (!isHost && !isGuest) return;
 
-			session.setPaddlePosition(isHost, data.x, data.y);
+			session.setPaddlePosition(isHost, data.x, data.y, data.sequence);
 		});
 
 		socket.on('leaveRoom', () => {
@@ -292,6 +341,8 @@ function handleLeave(
 
 	const isHost = socket.id === room.hostId;
 	const role = isHost ? 'host' : 'guest';
+	directReady.get(roomId)?.delete(role);
+	directPrepared.get(roomId)?.delete(role);
 	const session = sessions.get(roomId);
 
 	if (intentional) {
@@ -352,6 +403,8 @@ function destroyRoom(
 		cleanupTokensForRole(roomId, 'host');
 		cleanupTokensForRole(roomId, 'guest');
 		rooms.delete(roomId);
+		directReady.delete(roomId);
+		directPrepared.delete(roomId);
 		io.to(roomId).emit('roomClosed');
 		io.in(roomId).socketsLeave(roomId);
 	} else {
@@ -359,6 +412,8 @@ function destroyRoom(
 		if (session) {
 			session.stop();
 			rooms.delete(roomId);
+			directReady.delete(roomId);
+			directPrepared.delete(roomId);
 			io.to(roomId).emit('roomClosed');
 			io.in(roomId).socketsLeave(roomId);
 		} else {
