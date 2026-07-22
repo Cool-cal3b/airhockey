@@ -48,6 +48,7 @@ export class GameSession {
 	private statusBeforePause: GameState['status'] | null = null;
 	private tickCount = 0;
 	private sequence = 0;
+	private acknowledgedInput = { host: -1, guest: -1 };
 	private networkEveryNTicks = Math.round(TICK_RATE / SNAPSHOT_RATE);
 
 	constructor(maxScore: number, callbacks: GameEventCallback) {
@@ -278,8 +279,12 @@ export class GameSession {
 		this.puck.vy = 0;
 	}
 
-	setPaddlePosition(isHost: boolean, x: number, y: number) {
+	setPaddlePosition(isHost: boolean, x: number, y: number, inputSequence = -1) {
 		if (this.pushingPaddles) return;
+		const lastProcessed = isHost
+			? this.acknowledgedInput.host
+			: this.acknowledgedInput.guest;
+		if (inputSequence >= 0 && inputSequence <= lastProcessed) return;
 
 		if (this.resetGraceTicks > 0) {
 			const pushed = this.pushTargetOutOfCenter(x, y, isHost);
@@ -290,9 +295,11 @@ export class GameSession {
 		if (isHost) {
 			this.hostTarget.x = x;
 			this.hostTarget.y = y;
+			this.acknowledgedInput.host = Math.max(this.acknowledgedInput.host, inputSequence);
 		} else {
 			this.guestTarget.x = x;
 			this.guestTarget.y = y;
+			this.acknowledgedInput.guest = Math.max(this.acknowledgedInput.guest, inputSequence);
 		}
 	}
 
@@ -319,10 +326,12 @@ export class GameSession {
 	getState(): GameState {
 		return {
 			sequence: ++this.sequence,
+			simulationTick: this.tickCount,
 			serverTime: performance.now(),
 			puck: { x: this.puck.x, y: this.puck.y, vx: this.puck.vx, vy: this.puck.vy },
-			hostPaddle: { x: this.hostPaddle.x, y: this.hostPaddle.y },
-			guestPaddle: { x: this.guestPaddle.x, y: this.guestPaddle.y },
+			hostPaddle: { ...this.hostPaddle },
+			guestPaddle: { ...this.guestPaddle },
+			acknowledgedInput: { ...this.acknowledgedInput },
 			score: { ...this.score },
 			status: this.status,
 			elapsedMs: this.elapsedMs

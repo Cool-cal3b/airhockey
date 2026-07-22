@@ -13,12 +13,15 @@ import {
 	PADDLE_MAX_SPEED,
 	PUCK_MAX_SPEED,
 	TICK_MS,
-	INPUT_MS
+	INPUT_MS,
+	INTERPOLATION_DELAY_MS,
+	MAX_EXTRAPOLATION_MS
 } from '../constants.js';
-import { clampPaddleToHalf, stepPuck } from '../physics.js';
+import { clampPaddleToHalf } from '../physics.js';
 import { PointerInput } from '../input.js';
-import type { GameSocket } from '$lib/network/socket.js';
-import type { GameState } from '$lib/network/types.js';
+import { interpolatePaddle, interpolatePuck } from '../interpolation.js';
+import type { GameTransport } from '$lib/network/transport.js';
+import type { GameMessage, GameState } from '$lib/network/types.js';
 
 function hexToNum(hex: string): number {
 	return parseInt(hex.replace('#', ''), 16);
@@ -32,7 +35,7 @@ type InterpFrame = {
 };
 
 export class PlayScene extends Phaser.Scene {
-	private socket!: GameSocket;
+	private transport!: GameTransport;
 	private isHost!: boolean;
 	private pointerInput!: PointerInput;
 	private hostColorNum = 0x00d4ff;
@@ -51,8 +54,8 @@ export class PlayScene extends Phaser.Scene {
 	private goalText!: Phaser.GameObjects.Text;
 
 	private snapshotBuffer: Array<{ receivedAt: number; state: GameState }> = [];
-	private readonly INTERP_DELAY_MS = 50;
-	private readonly MAX_EXTRAPOLATION_MS = 50;
+	private readonly INTERP_DELAY_MS = INTERPOLATION_DELAY_MS;
+	private readonly MAX_EXTRAPOLATION_MS = MAX_EXTRAPOLATION_MS;
 	private readonly MAX_BUFFER_MS = 500;
 	private serverClockOffset: number | null = null;
 	private lastSequence = -1;
@@ -60,24 +63,16 @@ export class PlayScene extends Phaser.Scene {
 	private localPaddle = { x: 0, y: 0 };
 	private lastFrameTime = 0;
 	private lastPaddleSendTime = 0;
+	// A time-based starting point remains monotonic across a page refresh/rejoin.
+	private inputSequence = Date.now() * 100;
+	private removeTransportListener: (() => void) | null = null;
 	private prevStatus: GameState['status'] | null = null;
 	private graceUntil = 0;
 
-	// Client-side puck prediction. Each frame the puck is re-simulated from the latest
-	// authoritative snapshot up to "now" using our recorded paddle history, so our own
-	// strikes register instantly instead of after a full network round-trip. The replay
-	// is deterministic and stateless per frame (no drift), and reconciles automatically
-	// as new snapshots arrive.
 	private puckRenderX = RINK_WIDTH / 2;
 	private puckRenderY = RINK_HEIGHT / 2;
-	private predPrevX = RINK_WIDTH / 2;
-	private predPrevY = RINK_HEIGHT / 2;
 	private predictedVx = 0;
 	private predictedVy = 0;
-	private puckInitialized = false;
-	private paddleHistory: Array<{ t: number; x: number; y: number }> = [];
-	private readonly MAX_REPLAY_MS = 250;
-	private readonly PADDLE_HISTORY_MS = 600;
 
 	// Screen-shake feedback on strikes and goals.
 	private wasTouchingPuck = false;
@@ -115,7 +110,7 @@ export class PlayScene extends Phaser.Scene {
 	}
 
 	init(data: {
-		socket: GameSocket;
+		transport: GameTransport;
 		isHost: boolean;
 		onScore: (host: number, guest: number) => void;
 		onStatus: (status: GameState['status']) => void;
@@ -123,7 +118,7 @@ export class PlayScene extends Phaser.Scene {
 		hostColor: string;
 		guestColor: string;
 	}) {
-		this.socket = data.socket;
+		this.transport = data.transport;
 		this.isHost = data.isHost;
 		this.scoreCallback = data.onScore;
 		this.statusCallback = data.onStatus;
@@ -277,10 +272,22 @@ export class PlayScene extends Phaser.Scene {
 	}
 
 	private setupSocketListeners() {
-		this.socket.on('gameState', this.onGameState);
-		this.socket.on('countdown', this.onCountdown);
-		this.socket.on('goalScored', this.onGoalScored);
+		this.removeTransportListener = this.transport.onMessage(this.onTransportMessage);
 	}
+
+	private onTransportMessage = (message: GameMessage) => {
+		if (message.type === 'snapshot') {
+			this.onGameState(message.state);
+			return;
+		}
+		if (message.type !== 'event') return;
+		if (message.event.type === 'countdown') this.onCountdown({ seconds: message.event.seconds });
+		if (message.event.type === 'goal') this.onGoalScored();
+		if (message.event.type === 'gameOver') {
+			this.scoreCallback?.(message.event.hostScore, message.event.guestScore);
+			this.statusCallback?.('ended');
+		}
+	};
 
 	private onGameState = (state: GameState) => {
 		// Discard old or duplicated snapshots (volatile transport may reorder).
@@ -300,11 +307,7 @@ export class PlayScene extends Phaser.Scene {
 
 		this.lastSequence = state.sequence;
 
-		// The smallest observed offset is the sample least inflated by network delay.
-		const offsetSample = now - state.serverTime;
-		if (this.serverClockOffset === null || offsetSample < this.serverClockOffset) {
-			this.serverClockOffset = offsetSample;
-		}
+		this.serverClockOffset = this.transport.getClockOffset() ?? (now - state.serverTime);
 
 		this.snapshotBuffer.push({ receivedAt: now, state });
 
@@ -474,35 +477,13 @@ export class PlayScene extends Phaser.Scene {
 	}
 
 	private lerpPuck(frame: InterpFrame) {
-		// Short extrapolation covers late snapshots so the puck keeps moving.
-		if (frame.extrapolationMs > 0 && frame.to.status === 'playing') {
-			const seconds = frame.extrapolationMs / 1000;
-			return {
-				x: frame.to.puck.x + frame.to.puck.vx * seconds,
-				y: frame.to.puck.y + frame.to.puck.vy * seconds
-			};
-		}
-
-		// Status boundaries (goal reset, countdown end) teleport the puck — snap instead of lerping.
-		if (frame.from.status !== frame.to.status) {
-			return { x: frame.to.puck.x, y: frame.to.puck.y };
-		}
-		return {
-			x: frame.from.puck.x + (frame.to.puck.x - frame.from.puck.x) * frame.t,
-			y: frame.from.puck.y + (frame.to.puck.y - frame.from.puck.y) * frame.t
-		};
+		return interpolatePuck(frame);
 	}
 
 	private lerpOpponent(frame: InterpFrame) {
 		const from = this.isHost ? frame.from.guestPaddle : frame.from.hostPaddle;
 		const to = this.isHost ? frame.to.guestPaddle : frame.to.hostPaddle;
-		if (frame.from.status !== frame.to.status) {
-			return { x: to.x, y: to.y };
-		}
-		return {
-			x: from.x + (to.x - from.x) * frame.t,
-			y: from.y + (to.y - from.y) * frame.t
-		};
+		return interpolatePaddle(from, to, frame.t, frame.from.status !== frame.to.status);
 	}
 
 	update() {
@@ -557,9 +538,11 @@ export class PlayScene extends Phaser.Scene {
 
 			if (now - this.lastPaddleSendTime >= INPUT_MS) {
 				this.lastPaddleSendTime = now;
-				this.socket.volatile.emit('paddleMove', {
+				this.transport.sendInput({
+					sequence: ++this.inputSequence,
 					x: this.localPaddle.x,
-					y: this.localPaddle.y
+					y: this.localPaddle.y,
+					clientTime: now
 				});
 			}
 		}
@@ -568,12 +551,6 @@ export class PlayScene extends Phaser.Scene {
 		const useLocal = this.pointerInput.active && !useServerPosition;
 		const myX = useLocal ? this.localPaddle.x : myServerPos.x;
 		const myY = useLocal ? this.localPaddle.y : myServerPos.y;
-
-		// Record where our paddle is (in server-time) so prediction replay can re-apply
-		// our strikes on top of each authoritative snapshot.
-		if (this.serverClockOffset !== null) {
-			this.recordPaddle(now - this.serverClockOffset, myX, myY);
-		}
 
 		// A goal pop owns the puck sprite until the next round re-centres the puck.
 		if (this.goalPopPlaying) {
@@ -589,8 +566,6 @@ export class PlayScene extends Phaser.Scene {
 				this.puckGlow.setScale(1).setAlpha(1);
 				this.puckRenderX = cx;
 				this.puckRenderY = cy;
-				this.predPrevX = cx;
-				this.predPrevY = cy;
 				this.wasTouchingPuck = false;
 			}
 		}
@@ -602,7 +577,7 @@ export class PlayScene extends Phaser.Scene {
 			this.puckSprite.setVisible(puckVisible);
 			this.puckGlow.setVisible(puckVisible);
 
-			this.renderPuck(now, dt, latest, frame, myX, myY);
+			this.renderPuck(now, latest, frame, myX, myY);
 		}
 
 		const oppPos = this.lerpOpponent(frame);
@@ -622,125 +597,21 @@ export class PlayScene extends Phaser.Scene {
 
 	private renderPuck(
 		now: number,
-		dt: number,
 		latest: GameState,
 		frame: InterpFrame,
 		myX: number,
 		myY: number
 	) {
-		if (latest.status === 'playing' && this.serverClockOffset !== null) {
-			const predicted = this.predictPuck(now, latest);
-
-			const divX = predicted.x - this.puckRenderX;
-			const divY = predicted.y - this.puckRenderY;
-			if (!this.puckInitialized || divX * divX + divY * divY > 60 * 60) {
-				// First frame, goal reset, or large divergence: snap.
-				this.puckRenderX = predicted.x;
-				this.puckRenderY = predicted.y;
-			} else {
-				// Feed forward the real per-frame motion (zero lag on fast shots), then
-				// spring only the residual offset toward the prior target — this absorbs
-				// the small discontinuity when a new snapshot re-bases the prediction
-				// without dragging behind a fast-moving puck.
-				const feedX = predicted.x - this.predPrevX;
-				const feedY = predicted.y - this.predPrevY;
-				const k = 1 - Math.exp(-dt / 0.05);
-				this.puckRenderX += feedX + (this.predPrevX - this.puckRenderX) * k;
-				this.puckRenderY += feedY + (this.predPrevY - this.puckRenderY) * k;
-			}
-			this.predPrevX = predicted.x;
-			this.predPrevY = predicted.y;
-			this.predictedVx = predicted.vx;
-			this.predictedVy = predicted.vy;
-			this.puckInitialized = true;
-			this.maybeShakeOnHit(myX, myY, now);
-		} else {
-			const puckPos = this.lerpPuck(frame);
-			this.puckRenderX = puckPos.x;
-			this.puckRenderY = puckPos.y;
-			this.predPrevX = puckPos.x;
-			this.predPrevY = puckPos.y;
-			this.predictedVx = 0;
-			this.predictedVy = 0;
-			this.wasTouchingPuck = false;
-			this.puckInitialized = true;
-		}
+		// The puck is always rendered from buffered authoritative snapshots. Local
+		// paddle rendering remains immediate, but puck collisions have one authority.
+		const authoritative = this.lerpPuck(frame);
+		this.puckRenderX = authoritative.x;
+		this.puckRenderY = authoritative.y;
+		this.predictedVx = frame.to.puck.vx;
+		this.predictedVy = frame.to.puck.vy;
+		if (latest.status === 'playing') this.maybeShakeOnHit(myX, myY, now);
+		else this.wasTouchingPuck = false;
 		this.setPuckPosition(this.puckRenderX, this.puckRenderY);
-	}
-
-	// Re-simulate the puck from the latest authoritative snapshot up to the present using
-	// our recorded paddle history. Deterministic and stateless: the same inputs always
-	// produce the same result, so there is no accumulating prediction drift.
-	private predictPuck(now: number, base: GameState): { x: number; y: number; vx: number; vy: number } {
-		const present = now - (this.serverClockOffset as number);
-		let t = base.serverTime;
-		const end = t + Math.min(Math.max(present - t, 0), this.MAX_REPLAY_MS);
-
-		let px = base.puck.x;
-		let py = base.puck.y;
-		let pvx = base.puck.vx;
-		let pvy = base.puck.vy;
-
-		// Snapshots carry no paddle velocity, so hold the opponent's paddle where it was.
-		// A stale opponent position self-corrects on the next snapshot.
-		const oppServer = this.isHost ? base.guestPaddle : base.hostPaddle;
-		const opp = { x: oppServer.x, y: oppServer.y, vx: 0, vy: 0 };
-
-		while (end - t >= 1) {
-			const stepMs = Math.min(TICK_MS, end - t);
-			const stepS = stepMs / 1000;
-			const p0 = this.samplePaddle(t);
-			const p1 = this.samplePaddle(t + stepMs);
-			const my = {
-				x: p1.x,
-				y: p1.y,
-				vx: (p1.x - p0.x) / stepS,
-				vy: (p1.y - p0.y) / stepS
-			};
-			const host = this.isHost ? my : opp;
-			const guest = this.isHost ? opp : my;
-
-			const r = stepPuck({ x: px, y: py, vx: pvx, vy: pvy }, host, guest, stepS);
-			px = r.x;
-			py = r.y;
-			pvx = r.vx;
-			pvy = r.vy;
-			if (r.scored) break;
-			t += stepMs;
-		}
-
-		return { x: px, y: py, vx: pvx, vy: pvy };
-	}
-
-	private recordPaddle(t: number, x: number, y: number) {
-		const h = this.paddleHistory;
-		// t should increase monotonically; if the clock estimate stalls, just update the tail.
-		if (h.length > 0 && t <= h[h.length - 1].t) {
-			h[h.length - 1].x = x;
-			h[h.length - 1].y = y;
-			return;
-		}
-		h.push({ t, x, y });
-		const cutoff = t - this.PADDLE_HISTORY_MS;
-		while (h.length > 2 && h[0].t < cutoff) h.shift();
-	}
-
-	private samplePaddle(t: number): { x: number; y: number } {
-		const h = this.paddleHistory;
-		if (h.length === 0) return { x: this.localPaddle.x, y: this.localPaddle.y };
-		if (t <= h[0].t) return { x: h[0].x, y: h[0].y };
-		const last = h[h.length - 1];
-		if (t >= last.t) return { x: last.x, y: last.y };
-		for (let i = h.length - 1; i > 0; i--) {
-			const a = h[i - 1];
-			const b = h[i];
-			if (a.t <= t && t <= b.t) {
-				const span = b.t - a.t;
-				const f = span > 0 ? (t - a.t) / span : 0;
-				return { x: a.x + (b.x - a.x) * f, y: a.y + (b.y - a.y) * f };
-			}
-		}
-		return { x: last.x, y: last.y };
 	}
 
 	private maybeShakeOnHit(myX: number, myY: number, now: number) {
@@ -783,11 +654,15 @@ export class PlayScene extends Phaser.Scene {
 		if (now - this.lastDiagnosticsLogAt < 1000) return;
 
 		const d = this.diagnostics;
+		const network = this.transport.getDiagnostics();
+		const rtt = network.rttMs === null ? 'n/a' : `${network.rttMs.toFixed(1)}ms`;
+		const jitter = network.jitterMs === null ? 'n/a' : `${network.jitterMs.toFixed(1)}ms`;
 		// eslint-disable-next-line no-console
 		console.log(
 			`[net] snapshots/s=${d.received} missing=${d.missingSequences} ` +
 				`extrapolatedFrames=${d.extrapolatedFrames} ` +
-				`largestGap=${d.largestArrivalGap.toFixed(1)}ms interpDelay=${this.INTERP_DELAY_MS}ms`
+				`largestGap=${d.largestArrivalGap.toFixed(1)}ms interpDelay=${this.INTERP_DELAY_MS}ms ` +
+				`rtt=${rtt} jitter=${jitter}`
 		);
 
 		d.received = 0;
@@ -799,8 +674,7 @@ export class PlayScene extends Phaser.Scene {
 
 	shutdown() {
 		this.pointerInput.detach();
-		this.socket.off('gameState', this.onGameState);
-		this.socket.off('countdown', this.onCountdown);
-		this.socket.off('goalScored', this.onGoalScored);
+		this.removeTransportListener?.();
+		this.removeTransportListener = null;
 	}
 }

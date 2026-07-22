@@ -2,6 +2,7 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { connectSocket, loadSession } from '$lib/network/socket.js';
+	import { prepareDirectPeer, closeDirectPeer } from '$lib/network/webrtc.js';
 	import { NEON_COLORS, type RoomInfo, type NeonColorId } from '$lib/network/types.js';
 
 	const roomId = $derived(page.url.searchParams.get('roomId') ?? '');
@@ -16,6 +17,7 @@
 	let copied = $state(false);
 	let hostDisconnected = $state(false);
 	let hostGraceMs = $state(0);
+	let directPeerStarted = false;
 
 	const shareUrl = $derived(
 		typeof window !== 'undefined'
@@ -39,6 +41,7 @@
 				if (rejoinedRoom && role) {
 					room = rejoinedRoom;
 					myRole = role;
+					prepareDirectIfPossible();
 					return;
 				}
 				fetchRoom();
@@ -54,7 +57,10 @@
 		socket.emit('getRoom', { roomId }, (fetchedRoom) => {
 			if (fetchedRoom) {
 				room = fetchedRoom;
-				socket.emit('getMyRole', { roomId }, (role) => { myRole = role; });
+				socket.emit('getMyRole', { roomId }, (role) => {
+					myRole = role;
+					prepareDirectIfPossible();
+				});
 			} else {
 				goto('/');
 			}
@@ -73,20 +79,27 @@
 		socket.on('connect', () => {
 			connected = true;
 			restoreRoom();
+			if (directPeerStarted) socket.emit('directPrepare', { roomId });
 		});
 		socket.on('disconnect', () => { connected = false; });
-		socket.on('roomUpdated', (updatedRoom) => { room = updatedRoom; });
 		socket.on('hostDisconnected', ({ graceMs }) => {
 			hostDisconnected = true;
 			hostGraceMs = graceMs;
 		});
 		socket.on('hostReconnected', () => {
 			hostDisconnected = false;
-		hostGraceMs = 0;
+			hostGraceMs = 0;
+		});
+		socket.on('roomUpdated', (updatedRoom) => {
+			room = updatedRoom;
+			prepareDirectIfPossible();
 		});
 		socket.on('roomClosed', () => { goto('/'); });
-		socket.on('gameStarted', () => {
-			goto(`/game?roomId=${roomId}`);
+		socket.on('gameStarted', ({ mode }) => {
+			goto(`/game?roomId=${roomId}&mode=${mode}`);
+		});
+		socket.on('rtcPeerReady', () => {
+			if (myRole === 'host') void prepareDirectPeer(socket, roomId, myRole).start();
 		});
 
 		if (socket.connected) restoreRoom();
@@ -99,8 +112,22 @@
 			socket.off('hostReconnected');
 			socket.off('roomClosed');
 			socket.off('gameStarted');
+			socket.off('rtcPeerReady');
 		};
 	});
+
+	function prepareDirectIfPossible() {
+		if (myRole === 'host' && room && !room.guestId && directPeerStarted) {
+			closeDirectPeer();
+			directPeerStarted = false;
+			return;
+		}
+		if (!myRole || !room?.guestId || directPeerStarted || typeof RTCPeerConnection === 'undefined') return;
+		directPeerStarted = true;
+		const socket = connectSocket();
+		prepareDirectPeer(socket, roomId, myRole);
+		socket.emit('directPrepare', { roomId });
+	}
 
 	function submitName() {
 		if (!nameInput.trim()) return;
@@ -127,6 +154,7 @@
 
 	function leaveRoom() {
 		const socket = connectSocket();
+		closeDirectPeer();
 		socket.emit('leaveRoom');
 		goto('/');
 	}

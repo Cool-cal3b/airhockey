@@ -3,10 +3,13 @@
 	import { goto } from '$app/navigation';
 	import { onMount } from 'svelte';
 	import { connectSocket, loadSession, saveSession, clearSession } from '$lib/network/socket.js';
+	import { createGameTransport, closeGameTransport, type GameTransport } from '$lib/network/transport.js';
+	import { closeDirectPeer } from '$lib/network/webrtc.js';
 	import PhaserGame from '$lib/game/PhaserGame.svelte';
-	import { NEON_COLORS, RECONNECT_GRACE_MS, type GameState, type RoomInfo, type NeonColorId } from '$lib/network/types.js';
+	import { NEON_COLORS, RECONNECT_GRACE_MS, type GameState, type RoomInfo, type NeonColorId, type TransportMode } from '$lib/network/types.js';
 
 	const roomId = $derived(page.url.searchParams.get('roomId') ?? '');
+	const transportMode = $derived<TransportMode>(page.url.searchParams.get('mode') === 'direct' ? 'direct' : 'server');
 
 	let myRole = $state<'host' | 'guest' | null>(null);
 	let roleResolved = $state(false);
@@ -21,6 +24,7 @@
 	let opponentDisconnected = $state(false);
 	let graceRemaining = $state(0);
 	let graceInterval: ReturnType<typeof setInterval> | null = null;
+	let transport = $state<GameTransport | null>(null);
 
 	const socket = connectSocket();
 
@@ -95,7 +99,20 @@
 		return () => {
 			document.body.classList.remove('game-active');
 			clearGraceCountdown();
+			closeGameTransport();
+			closeDirectPeer();
 		};
+	});
+
+	$effect(() => {
+		if (!transport && myRole && room) {
+			try {
+				transport = createGameTransport(socket, transportMode, myRole, room.maxScore);
+			} catch (error) {
+				console.error(error);
+				goto('/');
+			}
+		}
 	});
 
 	function resolveRole(role: 'host' | 'guest' | null) {
@@ -184,9 +201,9 @@
 		</div>
 
 		<div class="rink-container">
-			{#if roleResolved}
+			{#if roleResolved && transport}
 				<PhaserGame
-					{socket}
+					{transport}
 					{isHost}
 					onScore={handleScore}
 					onStatus={handleStatus}

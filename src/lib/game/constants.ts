@@ -19,7 +19,12 @@ export const TICK_MS = 1000 / TICK_RATE;
 export const INPUT_RATE = 60;
 export const INPUT_MS = 1000 / INPUT_RATE;
 
-export const SNAPSHOT_RATE = 30;
+export const SNAPSHOT_RATE = 60;
+
+// A larger buffer absorbs one or two delayed snapshots without freezing or
+// exposing authority corrections as visible puck jumps.
+export const INTERPOLATION_DELAY_MS = 90;
+export const MAX_EXTRAPOLATION_MS = 35;
 
 export const COUNTDOWN_SECONDS = 3;
 export const GOAL_RESET_DELAY_MS = 1500;
